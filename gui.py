@@ -28,10 +28,29 @@ gui_set_flow_active = [None]
 def main_window(page: ft.Page):
     page.title = "PixivVault"
     page.theme_mode = ft.ThemeMode.DARK
+    page.theme = ft.Theme(color_scheme_seed="#0096FA")
+    page.dark_theme = ft.Theme(color_scheme_seed="#0096FA")
     page.window.width = 800
     page.window.height = 600
 
     db = Database()
+
+    def get_adjusted_color(col: str):
+        if page.theme_mode == ft.ThemeMode.LIGHT:
+            if col in [ft.Colors.BLUE_200, ft.Colors.BLUE_300, ft.Colors.BLUE_400]:
+                return ft.Colors.BLUE_700
+            elif col in [ft.Colors.GREEN_300, ft.Colors.GREEN_400]:
+                return ft.Colors.GREEN_700
+            elif col in [ft.Colors.RED_300, ft.Colors.RED_400, ft.Colors.ORANGE_300, ft.Colors.ORANGE_400]:
+                return ft.Colors.ERROR
+            elif col in [ft.Colors.GREY_300, ft.Colors.GREY_400, ft.Colors.GREY_500]:
+                return ft.Colors.ON_SURFACE_VARIANT
+        else:
+            if col in [ft.Colors.ORANGE_300, ft.Colors.ORANGE_400]:
+                return ft.Colors.ERROR
+            elif col in [ft.Colors.GREY_600, ft.Colors.GREY_700, ft.Colors.GREY_800]:
+                return ft.Colors.GREY_400
+        return col
 
     # --- 共通コントロール ---
     # 個別DL・一括DL・ブックマークDLは互いに独立して同時起動できるため、
@@ -68,7 +87,7 @@ def main_window(page: ft.Page):
             top=ft.BorderSide(1, ft.Colors.OUTLINE), bottom=ft.BorderSide(1, ft.Colors.OUTLINE),
             left=ft.BorderSide(1, ft.Colors.OUTLINE), right=ft.BorderSide(1, ft.Colors.OUTLINE),
         ),
-        border_radius=5, padding=10, expand=True, bgcolor="#1A1C1E"
+        border_radius=5, padding=10, expand=True, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST
     )
 
     list_expanded = [False]
@@ -77,9 +96,10 @@ def main_window(page: ft.Page):
         log_container.visible = not list_expanded[0]
         page.update()
 
-    def append_log(msg: str, color: str = ft.Colors.WHITE):
+    def append_log(msg: str, color: str = ft.Colors.ON_SURFACE):
         time_str = datetime.now().strftime("%y%m%d %H:%M:%S")
-        log_area.controls.append(ft.Text(f"[{time_str}] {msg}", color=color, selectable=True, size=13))
+        final_color = get_adjusted_color(color)
+        log_area.controls.append(ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500))
         page.update()
     def handle_log(msg: str):
         append_log(msg)
@@ -88,7 +108,7 @@ def main_window(page: ft.Page):
     
     gui_log_callback[0] = handle_log
 
-    login_status_text = ft.Text("ログインチェック中...", color=ft.Colors.BLUE_200, size=12)
+    login_status_text = ft.Text("ログインチェック中...", color=ft.Colors.PRIMARY, size=13, weight=ft.FontWeight.W_500)
 
     def clear_user_id_field(e):
         user_id_field.value = ""
@@ -128,7 +148,7 @@ def main_window(page: ft.Page):
 
     progress_bar  = ft.ProgressBar(width=400, value=0, visible=False)
     progress_text = ft.Text("0 / 0", visible=False)
-    remaining_time_text = ft.Text("", size=12, color=ft.Colors.BLUE_200)
+    remaining_time_text = ft.Text("", size=13, color=ft.Colors.PRIMARY, weight=ft.FontWeight.W_500)
 
     progress_history = []
 
@@ -183,7 +203,7 @@ def main_window(page: ft.Page):
     def run_backup_thread():
         user_id = user_id_field.value.strip()
         if not user_id:
-            append_log("ユーザーIDを入力してください。", color=ft.Colors.ORANGE_300)
+            append_log("ユーザーIDを入力してください。", color=ft.Colors.ERROR)
             return
         if not os.path.exists("cookies.txt"):
             handle_alert("cookies.txt が見つかりません。設定ボタンからインポートしてください。")
@@ -300,7 +320,7 @@ def main_window(page: ft.Page):
 
     batch_progress_bar  = ft.ProgressBar(width=400, value=0, visible=False)
     batch_progress_text = ft.Text("0 / 0", visible=False)
-    batch_remaining_time_text = ft.Text("", size=12, color=ft.Colors.BLUE_200)
+    batch_remaining_time_text = ft.Text("", size=13, color=ft.Colors.PRIMARY, weight=ft.FontWeight.W_500)
 
     def load_follow_list_ui(search_val_override=None):
         # 現在のチェックボックスの選択状態を退避
@@ -423,7 +443,7 @@ def main_window(page: ft.Page):
                 dlg = ft.AlertDialog(
                     title=ft.Text(f"「{uname}」個別設定", size=16, weight=ft.FontWeight.BOLD),
                     content=ft.Column([
-                        ft.Text("この作者のみ適用するオーバーライド設定です。", size=12, color=ft.Colors.GREY_400),
+                        ft.Text("この作者のみ適用するオーバーライド設定です。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
                         dd_target,
                         dd_zip
                     ], tight=True, spacing=10),
@@ -505,7 +525,7 @@ def main_window(page: ft.Page):
             ft.Text("実行結果サマリー: ", weight=ft.FontWeight.BOLD),
             batch_summary_text
         ], wrap=True),
-        bgcolor="#252A30",
+        bgcolor=ft.Colors.SURFACE_CONTAINER,
         padding=10,
         border_radius=8,
         border=ft.Border(
@@ -518,7 +538,7 @@ def main_window(page: ft.Page):
     def run_batch_thread():
         selected_ids = [uid for uid, cb in follow_checkboxes.items() if cb.value]
         if not selected_ids:
-            append_log("ダウンロードする作者を選択してください。", color=ft.Colors.ORANGE_300)
+            append_log("ダウンロードする作者を選択してください。", color=ft.Colors.ERROR)
             return
         if not os.path.exists("cookies.txt"):
             handle_alert("cookies.txt が見つかりません。")
@@ -544,11 +564,11 @@ def main_window(page: ft.Page):
             )
             if stats and isinstance(stats, dict):
                 batch_summary_text.controls = [
-                    ft.Container(content=ft.Text(f"〇 新規: {stats.get('new_count', 0)}件", color=ft.Colors.GREEN_300, weight=ft.FontWeight.BOLD), bgcolor="#1F3A2A", padding=4, border_radius=4),
-                    ft.Container(content=ft.Text(f"△ 更新: {stats.get('updated_count', 0)}件", color=ft.Colors.BLUE_300, weight=ft.FontWeight.BOLD), bgcolor="#1F2A3A", padding=4, border_radius=4),
-                    ft.Container(content=ft.Text(f"× 削除検知: {stats.get('deleted_count', 0)}件", color=ft.Colors.RED_300 if stats.get('deleted_count', 0) > 0 else ft.Colors.GREY_400, weight=ft.FontWeight.BOLD), bgcolor="#3A1F1F" if stats.get('deleted_count', 0) > 0 else "#2A2A2A", padding=4, border_radius=4),
-                    ft.Container(content=ft.Text(f"↺ 復帰: {stats.get('restored_count', 0)}件", color=ft.Colors.TEAL_300, weight=ft.FontWeight.BOLD), bgcolor="#1F3A3A", padding=4, border_radius=4),
-                    ft.Text(f"スキップ: {stats.get('skipped_count', 0)}件 | エラー: {stats.get('failed_count', 0)}件", size=12, color=ft.Colors.GREY_400)
+                    ft.Container(content=ft.Text(f"〇 新規: {stats.get('new_count', 0)}件", color=ft.Colors.GREEN, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.GREEN), padding=4, border_radius=4),
+                    ft.Container(content=ft.Text(f"△ 更新: {stats.get('updated_count', 0)}件", color=ft.Colors.BLUE, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.BLUE), padding=4, border_radius=4),
+                    ft.Container(content=ft.Text(f"× 削除検知: {stats.get('deleted_count', 0)}件", color=ft.Colors.RED if stats.get('deleted_count', 0) > 0 else ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.RED) if stats.get('deleted_count', 0) > 0 else ft.Colors.SURFACE_CONTAINER_HIGHEST, padding=4, border_radius=4),
+                    ft.Container(content=ft.Text(f"↺ 復帰: {stats.get('restored_count', 0)}件", color=ft.Colors.TEAL, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.TEAL), padding=4, border_radius=4),
+                    ft.Text(f"スキップ: {stats.get('skipped_count', 0)}件 | エラー: {stats.get('failed_count', 0)}件", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
                 ]
                 batch_summary_card.visible = True
             append_log("--- 一括ダウンロードが完了しました ---", color=ft.Colors.GREEN_400)
@@ -643,11 +663,11 @@ def main_window(page: ft.Page):
     export_btn.on_click = lambda _: threading.Thread(target=run_export_thread, daemon=True).start()
 
     # --- 設定ダイアログ ---
-    cookie_status_text = ft.Text("", selectable=True, visible=False, size=12)
-    sync_status_text   = ft.Text("", selectable=True, visible=False, size=12)
+    cookie_status_text = ft.Text("", selectable=True, visible=False, size=13, weight=ft.FontWeight.W_500)
+    sync_status_text   = ft.Text("", selectable=True, visible=False, size=13, weight=ft.FontWeight.W_500)
     save_path_text     = ft.Text(
         f"現在の保存先: {db.get_setting('save_path', 'Images')}",
-        selectable=True, color=ft.Colors.BLUE_200, size=12
+        selectable=True, color=ft.Colors.PRIMARY, size=13, weight=ft.FontWeight.W_600
     )
 
     # --- ファイル/フォルダー選択 (tkinterのネイティブダイアログを使用) ---
@@ -694,12 +714,12 @@ def main_window(page: ft.Page):
                 if src_path != dst_path:
                     shutil.copy2(src_path, dst_path)
                 cookie_status_text.value = "[完了] cookies.txt をインポートしました。"
-                cookie_status_text.color = ft.Colors.GREEN_400
+                cookie_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
                 cookie_status_text.visible = True
                 threading.Thread(target=check_login_status, daemon=True).start()
             else:
                 cookie_status_text.value = "キャンセルされました。"
-                cookie_status_text.color = ft.Colors.GREY_400
+                cookie_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
                 cookie_status_text.visible = True
         except Exception as ex:
             cookie_status_text.value = f"[失敗] {ex}"
@@ -734,7 +754,7 @@ def main_window(page: ft.Page):
 
     def sync_follow_list():
         sync_status_text.value = "Pixivから同期中..."
-        sync_status_text.color = ft.Colors.BLUE_400
+        sync_status_text.color = get_adjusted_color(ft.Colors.BLUE_400)
         sync_status_text.visible = True
         page.update()
         try:
@@ -745,7 +765,7 @@ def main_window(page: ft.Page):
             db.save_following_users(users)
             db.set_setting("last_sync_date", datetime.now().isoformat())
             sync_status_text.value = f"[完了] 同期完了 ({len(users)}人の作者)"
-            sync_status_text.color = ft.Colors.GREEN_400
+            sync_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
             sync_status_text.visible = True
             load_follow_list_ui()
         except Exception as e:
@@ -830,7 +850,7 @@ def main_window(page: ft.Page):
         on_change=lambda e: db.set_setting("minimize_to_tray", "1" if e.control.value else "0")
     )
     
-    cache_status_text = ft.Text("", size=12)
+    cache_status_text = ft.Text("", size=13, weight=ft.FontWeight.W_500)
 
     def on_clear_cache_click(e):
         import os
@@ -846,10 +866,10 @@ def main_window(page: ft.Page):
                         pass
         if deleted_count > 0:
             cache_status_text.value = f"キャッシュを削除しました ({deleted_count}件)"
-            cache_status_text.color = ft.Colors.GREEN_400
+            cache_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
         else:
             cache_status_text.value = "キャッシュはありませんでした。"
-            cache_status_text.color = ft.Colors.GREY_400
+            cache_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
         append_log(f"画像のキャッシュを削除しました ({deleted_count}件)")
         page.update()
 
@@ -861,7 +881,7 @@ def main_window(page: ft.Page):
 
     clear_cache_container = ft.Container(
         content=ft.Column([
-            ft.Text("未フォロー作者確認時のサムネイル画像キャッシュを削除します。", size=12, color=ft.Colors.GREY_400),
+            ft.Text("未フォロー作者確認時のサムネイル画像キャッシュを削除します。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
             ft.Row([clear_cache_btn, cache_status_text], vertical_alignment=ft.CrossAxisAlignment.CENTER)
         ], spacing=4),
         padding=ft.padding.Padding(10, 6, 0, 6)
@@ -926,19 +946,19 @@ def main_window(page: ft.Page):
         title=ft.Text("設定"),
         content=ft.Column([
             ft.Text("1. Cookie のインポート", weight=ft.FontWeight.BOLD),
-            ft.Text("Pixivのログイン状態を引き継ぐための cookies.txt を選択してください。", size=12, color=ft.Colors.GREY_400),
+            ft.Text("Pixivのログイン状態を引き継ぐための cookies.txt を選択してください。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
             ft.ElevatedButton("ファイルを選択", icon=ft.Icons.UPLOAD_FILE,
                               on_click=lambda _: threading.Thread(target=_run_cookie_file_picker, daemon=True).start()),
             cookie_status_text,
             ft.Divider(),
             ft.Text("2. フォロー中リストの同期", weight=ft.FontWeight.BOLD),
-            ft.Text("Pixivからフォロー中の作者情報を取得し、DBに保存します。", size=12, color=ft.Colors.GREY_400),
+            ft.Text("Pixivからフォロー中の作者情報を取得し、DBに保存します。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
             ft.ElevatedButton("リストを同期", icon=ft.Icons.SYNC,
                               on_click=lambda _: threading.Thread(target=sync_follow_list, daemon=True).start()),
             sync_status_text,
             ft.Divider(),
             ft.Text("3. 保存フォルダーの設定", weight=ft.FontWeight.BOLD),
-            ft.Text("画像のダウンロード先フォルダーを指定します（再起動後も保持）。", size=12, color=ft.Colors.GREY_400),
+            ft.Text("画像のダウンロード先フォルダーを指定します（再起動後も保持）。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
             ft.ElevatedButton("フォルダーを選択", icon=ft.Icons.FOLDER_OPEN,
                               on_click=lambda _: threading.Thread(target=_run_folder_picker, daemon=True).start()),
             save_path_text,
@@ -1005,13 +1025,55 @@ def main_window(page: ft.Page):
         on_click=open_save_folder
     )
 
+    def toggle_theme(e):
+        if page.theme_mode == ft.ThemeMode.DARK:
+            page.theme_mode = ft.ThemeMode.LIGHT
+            theme_toggle_btn.icon = ft.Icons.DARK_MODE
+            theme_toggle_btn.tooltip = "ダークモードへ切り替え"
+        else:
+            page.theme_mode = ft.ThemeMode.DARK
+            theme_toggle_btn.icon = ft.Icons.LIGHT_MODE
+            theme_toggle_btn.tooltip = "ライトモードへ切り替え"
+
+        for btn in tab_buttons:
+            if btn.data != 99:
+                is_selected = (btn.data == current_tab_idx[0])
+                btn.style = ft.ButtonStyle(
+                    color=ft.Colors.PRIMARY if is_selected else ft.Colors.ON_SURFACE,
+                    bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.PRIMARY) if is_selected else ft.Colors.TRANSPARENT,
+                )
+
+        for ctrl in log_area.controls:
+            if hasattr(ctrl, "color") and ctrl.color:
+                ctrl.color = get_adjusted_color(ctrl.color)
+        for ctrl in queue_log_area.controls:
+            if hasattr(ctrl, "color") and ctrl.color:
+                ctrl.color = get_adjusted_color(ctrl.color)
+
+        page.update()
+
+    theme_toggle_btn = ft.IconButton(
+        icon=ft.Icons.LIGHT_MODE, tooltip="ライトモードへ切り替え",
+        on_click=toggle_theme
+    )
+
+    def open_settings_dialog(e=None):
+        if cookie_status_text.color:
+            cookie_status_text.color = get_adjusted_color(cookie_status_text.color)
+        if sync_status_text.color:
+            sync_status_text.color = get_adjusted_color(sync_status_text.color)
+        if cache_status_text.color:
+            cache_status_text.color = get_adjusted_color(cache_status_text.color)
+        save_path_text.color = ft.Colors.PRIMARY
+        page.show_dialog(settings_dialog)
+
     settings_btn = ft.IconButton(
         icon=ft.Icons.SETTINGS, tooltip="設定",
-        on_click=lambda _: page.show_dialog(settings_dialog)
+        on_click=open_settings_dialog
     )
 
     # --- 拡張機能タブ ---
-    ext_status_text = ft.Text("未登録", color=ft.Colors.GREY_400, weight=ft.FontWeight.BOLD)
+    ext_status_text = ft.Text("未登録", color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.BOLD)
     
     def update_ext_status():
         import sys
@@ -1025,7 +1087,7 @@ def main_window(page: ft.Page):
                 ext_status_text.color = ft.Colors.GREEN_400
             else:
                 ext_status_text.value = "無効（レジストリ未登録）"
-                ext_status_text.color = ft.Colors.GREY_400
+            ext_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
         page.update()
 
     def on_register_ext(e):
@@ -1052,14 +1114,14 @@ def main_window(page: ft.Page):
         ft.Container(height=10),
         ft.Container(
             content=ft.Column([
-                ft.Text("⚠️ 自動起動について", weight=ft.FontWeight.BOLD, color=ft.Colors.ORANGE_400),
+                ft.Text("⚠️ 自動起動について", weight=ft.FontWeight.BOLD, color=ft.Colors.ERROR),
                 ft.Text(
                     "アプリが起動していない時にボタンを押した場合、ブラウザから自動でこのアプリを起動することができます。\n"
                     "この機能を有効にするには、Windowsのレジストリ（HKEY_CURRENT_USER）にカスタムURLスキームを書き込みます。",
-                    size=12, color=ft.Colors.GREY_300
+                    size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500
                 ),
             ]),
-            bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.ORANGE),
+            bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.ERROR),
             padding=10,
             border_radius=8
         ),
@@ -1083,16 +1145,17 @@ def main_window(page: ft.Page):
             left=ft.BorderSide(1, ft.Colors.OUTLINE),
             right=ft.BorderSide(1, ft.Colors.OUTLINE),
         ),
-        bgcolor="#1A1C1E",
+        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
         border_radius=5,
         padding=10,
         expand=True
     )
 
-    def append_queue_log(msg: str, color: str = ft.Colors.WHITE):
+    def append_queue_log(msg: str, color: str = ft.Colors.ON_SURFACE):
         time_str = datetime.now().strftime("%y%m%d %H:%M:%S")
+        final_color = get_adjusted_color(color)
         queue_log_area.controls.append(
-            ft.Text(f"[{time_str}] {msg}", color=color, selectable=True, size=13)
+            ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500)
         )
         page.update()
 
@@ -1103,7 +1166,7 @@ def main_window(page: ft.Page):
             ft.Icon(ft.Icons.LIST_ALT, color=ft.Colors.BLUE_400),
             ft.Text("拡張機能からのダウンロードキューログ", size=16, weight=ft.FontWeight.BOLD),
         ]),
-        ft.Text("ブラウザ拡張機能から追加されたダウンロードリクエストの進捗をリアルタイム表示します。", size=13, color=ft.Colors.WHITE70),
+        ft.Text("ブラウザ拡張機能から追加されたダウンロードリクエストの進捗をリアルタイム表示します。", size=13, color=ft.Colors.ON_SURFACE_VARIANT),
         queue_log_container
     ], expand=True)
 
@@ -1262,12 +1325,12 @@ def main_window(page: ft.Page):
                 follow_btn = ft.ElevatedButton("フォロー", icon="person_add")
                 work_thumb_container = ft.Container(
                     width=80, height=80,
-                    bgcolor=ft.Colors.GREY_800,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
                     border_radius=6
                 )
                 icon_container = ft.Container(
                     width=28, height=28,
-                    bgcolor=ft.Colors.GREY_700,
+                    bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
                     border_radius=14
                 )
 
@@ -1308,7 +1371,7 @@ def main_window(page: ft.Page):
                             icon_container,
                             ft.Text(f"{_author['user_name']} ({_author['user_id']})", weight=ft.FontWeight.BOLD)
                         ], spacing=8),
-                        ft.Text(f"代表作: {_author.get('work_title', '')}", size=12, color=ft.Colors.GREY_400, width=280)
+                        ft.Text(f"代表作: {_author.get('work_title', '')}", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500, width=280)
                     ], expand=True),
                     follow_btn,
                     status_text
@@ -1367,7 +1430,7 @@ def main_window(page: ft.Page):
 
     tab_bookmark_content = ft.Column([
         ft.Text("ブックマーク一括ダウンロード", size=20, weight=ft.FontWeight.BOLD),
-        ft.Text("あなたのブックマーク作品を一括保存し、保存フォルダに階層化またはフラット配置します。", size=12, color=ft.Colors.GREY_400),
+        ft.Text("あなたのブックマーク作品を一括保存し、保存フォルダに階層化またはフラット配置します。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
         ft.Divider(),
         ft.Row([bm_target_type_dropdown, bm_rest_type_dropdown, bm_run_btn, check_unfollowed_btn, bm_pause_btn, bm_stop_btn], wrap=True),
         ft.Row([bm_progress_bar, bm_progress_text, bm_remaining_time_text]),
@@ -1417,12 +1480,12 @@ def main_window(page: ft.Page):
                     content=ft.Row([
                         ft.Column([
                             ft.Text(f"{title} (ID: {wid})", weight=ft.FontWeight.BOLD),
-                            ft.Text(f"理由: {reason} | リトライ回数: {rc}", size=12, color=ft.Colors.ORANGE_300),
+                            ft.Text(f"理由: {reason} | リトライ回数: {rc}", size=12, color=ft.Colors.ERROR, weight=ft.FontWeight.W_500),
                         ], expand=True),
                         ft.ElevatedButton("再試行", icon=ft.Icons.REFRESH, on_click=make_retry_one()),
                         ft.IconButton(ft.Icons.DELETE_OUTLINE, tooltip="削除", on_click=make_remove_one()),
                     ]),
-                    bgcolor="#2A2D30",
+                    bgcolor=ft.Colors.SURFACE_CONTAINER,
                     padding=10,
                     border_radius=6
                 )
@@ -1470,7 +1533,7 @@ def main_window(page: ft.Page):
             ft.Text("ダウンロード失敗キュー・保存品質異常リスト", size=20, weight=ft.FontWeight.BOLD),
             ft.IconButton(ft.Icons.REFRESH, tooltip="リスト更新", on_click=lambda _: load_failed_queue_ui()),
         ]),
-        ft.Text("通信エラーや品質異常（0バイト/破損等）が発生した作品一覧です。再試行やCSVエクスポートが行えます。", size=12, color=ft.Colors.GREY_400),
+        ft.Text("通信エラーや品質異常（0バイト/破損等）が発生した作品一覧です。再試行やCSVエクスポートが行えます。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
         ft.Row([
             ft.ElevatedButton("全件再試行", icon=ft.Icons.PLAY_ARROW, color=ft.Colors.WHITE, bgcolor=ft.Colors.BLUE_600, on_click=on_retry_all_failed),
             ft.OutlinedButton("CSV出力", icon=ft.Icons.FILE_DOWNLOAD, on_click=on_export_failed_csv),
@@ -1515,7 +1578,7 @@ def main_window(page: ft.Page):
                 return
 
             if not rows:
-                append_log("直近バックアップ履歴: 対象データがありません（works.last_backupが未設定）。", color=ft.Colors.GREY_400)
+                append_log("直近バックアップ履歴: 対象データがありません（works.last_backupが未設定）。", color=get_adjusted_color(ft.Colors.GREY_400))
                 return
 
             import glob
@@ -1671,7 +1734,7 @@ def main_window(page: ft.Page):
                     width=140,
                     height=140,
                     border_radius=10,
-                    bgcolor="#23272A",
+                    bgcolor=ft.Colors.SURFACE_CONTAINER,
                     clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
                     tooltip=f"{display_name} ({user_id})\nクリックして開く",
                     content=ft.GestureDetector(
@@ -1710,7 +1773,7 @@ def main_window(page: ft.Page):
                 append_log(
                     f"直近のバックアップ: 表示できるタイルがありませんでした "
                     f"(フォルダ/ZIP未検出:{skipped_no_dir}件 / 画像なし:{skipped_no_image}件)。",
-                    color=ft.Colors.ORANGE_400
+                    color=ft.Colors.ERROR
                 )
 
         page.run_thread(_load_history_thread)
@@ -1736,23 +1799,26 @@ def main_window(page: ft.Page):
 
     tab_containers = [tab1_container, tab2_container, tab_bookmark_container, tab_queue_container, tab_failed_container, tab_extension_container, tab_backup_history_container]
     tab_buttons = []
+    current_tab_idx = [0]
 
     def on_tab_change(idx):
         if idx == 99:
             open_save_folder()
             return
 
+        current_tab_idx[0] = idx
         for i, container in enumerate(tab_containers):
             container.visible = (i == idx)
 
         for btn in tab_buttons:
             if btn.data != 99:
+                is_selected = (btn.data == idx)
                 btn.style = ft.ButtonStyle(
-                    color=ft.Colors.BLUE_400 if btn.data == idx else ft.Colors.GREY_400,
-                    bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.BLUE) if btn.data == idx else ft.Colors.TRANSPARENT,
+                    color=ft.Colors.PRIMARY if is_selected else ft.Colors.ON_SURFACE,
+                    bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.PRIMARY) if is_selected else ft.Colors.TRANSPARENT,
                 )
 
-        history_btn.icon_color = ft.Colors.BLUE_400 if idx == 6 else None
+        history_btn.icon_color = ft.Colors.PRIMARY if idx == 6 else None
         log_container.visible = (idx != 6)
 
         # 可視化の更新を先に確定させてから、直近バックアップグリッドへの
@@ -1770,8 +1836,8 @@ def main_window(page: ft.Page):
             data=idx,
             on_click=lambda e, i=idx: on_tab_change(i),
             style=ft.ButtonStyle(
-                color=ft.Colors.BLUE_400 if idx == 0 else ft.Colors.GREY_400,
-                bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.BLUE) if idx == 0 else ft.Colors.TRANSPARENT,
+                color=ft.Colors.PRIMARY if idx == 0 else ft.Colors.ON_SURFACE,
+                bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.PRIMARY) if idx == 0 else ft.Colors.TRANSPARENT,
             )
         )
         tab_buttons.append(btn)
@@ -1796,7 +1862,7 @@ def main_window(page: ft.Page):
                 ft.Text("PixivVault", size=32, weight=ft.FontWeight.BOLD),
                 login_status_text,
             ]),
-            ft.Row([history_btn, open_folder_btn, settings_btn], spacing=5)
+            ft.Row([history_btn, open_folder_btn, theme_toggle_btn, settings_btn], spacing=5)
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         custom_tab_bar,
         tab1_container,
@@ -1850,7 +1916,7 @@ def main_window(page: ft.Page):
                 trigger_auto_sync(uid)
         elif st == "warning":
             login_status_text.value = f"▲ [期限切れ間近] {msg}"
-            login_status_text.color = ft.Colors.ORANGE_400
+            login_status_text.color = ft.Colors.ERROR
             if uid:
                 db.set_setting("my_user_id", str(uid))
                 trigger_auto_sync(uid)

@@ -54,6 +54,92 @@ def _verify_zip_and_notify(db: Database, zip_path: str, label: str, log, alert=N
         alert(msg)
     notify_toast(db, "PixivVault - ZIP破損検出", f"{label} のアーカイブに問題があります: {reason}")
 
+# 【魔法の解放】Pythonの zipfile.ZIP64_LIMIT は標準で2GB(0x7FFFFFFF)に設定されているため、
+# 2GB超~4GB未満のサイズ・オフセットでも allowZip64=False 時に例外が出たり、
+# allowZip64=True 時に途中からZip64に切り替わるキメラZIPを生成してしまう。
+# 本来のZIP規格上限である4GB(0xFFFFFFFF)へと解放してキメラ構造の発生を永久防止する。
+try:
+    zipfile.ZIP64_LIMIT = 0xFFFFFFFF
+except Exception:
+    pass
+
+def _has_zip64_extra(extra: bytes) -> bool:
+    """ZipInfo.extra (拡張フィールド) 内にZip64拡張情報ヘッダ(header_id=1)が含まれるか判定する。"""
+    pos = 0
+    while pos + 4 <= len(extra):
+        header_id = int.from_bytes(extra[pos:pos + 2], 'little')
+        data_size = int.from_bytes(extra[pos + 2:pos + 4], 'little')
+        if header_id == 1:
+            return True
+        pos += 4 + data_size
+    return False
+
+def normalize_zip_for_compatibility(zip_path: str, log_callback=None):
+    """
+    ZIPファイルのサイズが大きな場合（例えば1.8GB以上）や追記によって
+    標準32bitヘッダとZip64拡張ヘッダが途中混在するキメラ構造になった場合、
+    またはパス区切りの異常がある場合に、全エントリを一貫したフォーマットへ自動正規化します。
+    """
+    if not os.path.exists(zip_path):
+        return
+
+    temp_path = f"{zip_path}.temp_normalize"
+    try:
+        size = os.path.getsize(zip_path)
+        # 1.8 GiB (1,932,735,283 bytes) 以上、またはパスセパレータ異常や途中混在キメラを検出した場合にリビルド
+        needs_normalize = (size > 1800 * 1024 * 1024)
+
+        if not needs_normalize:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                has_std = False
+                has_zip64 = False
+                for info in zf.infolist():
+                    if '\\' in info.filename:
+                        needs_normalize = True
+                        break
+                    is_64 = (info.header_offset > 2147483647) or _has_zip64_extra(info.extra)
+                    if is_64:
+                        has_zip64 = True
+                    else:
+                        has_std = True
+                    if has_std and has_zip64:
+                        needs_normalize = True
+                        break
+
+        if not needs_normalize:
+            return
+
+        # 4 GiB (4,000,000,000 bytes) 未満であれば allowZip64=False を厳格に指定し、
+        # 前半が標準32bit・後半がZip64となるキメラ状態を完全に回避した純粋32bit書庫にする
+        use_zip64 = (size >= 4000 * 1024 * 1024)
+        if log_callback:
+            mode_str = "Zip64一貫モード" if use_zip64 else "純粋32bit一貫モード"
+            log_callback(f"ZIP書庫の正規化（キメラ構造防止・{mode_str}化）を実行します: {os.path.basename(zip_path)}", "INFO")
+
+        with zipfile.ZipFile(zip_path, 'r') as src_zip, \
+             zipfile.ZipFile(temp_path, 'w', compression=zipfile.ZIP_DEFLATED, allowZip64=use_zip64) as dst_zip:
+            for info in src_zip.infolist():
+                file_data = src_zip.read(info.filename)
+                new_filename = info.filename.replace('\\', '/')
+                new_info = zipfile.ZipInfo(filename=new_filename, date_time=info.date_time)
+                new_info.compress_type = info.compress_type
+                new_info.external_attr = info.external_attr
+                new_info.flag_bits = info.flag_bits
+                dst_zip.writestr(new_info, file_data)
+
+        os.replace(temp_path, zip_path)
+        if log_callback:
+            log_callback(f"ZIP書庫の正規化が正常に完了しました: {os.path.basename(zip_path)}", "INFO")
+    except Exception as e:
+        if log_callback:
+            log_callback(f"ZIP書庫の正規化中に警告: {e}", "WARNING")
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
 def append_to_zip(author_dir: str, zip_path: str, log_callback=None):
     """ディレクトリ内のファイルをZIPファイルの末尾に追加し、追加した元ファイルを削除します"""
     if not os.path.exists(author_dir):
@@ -68,14 +154,20 @@ def append_to_zip(author_dir: str, zip_path: str, log_callback=None):
         existing_names = set()
         if os.path.exists(zip_path):
             with zipfile.ZipFile(zip_path, 'r') as existing_zip:
-                existing_names = set(existing_zip.namelist())
+                existing_names = set(name.replace('\\', '/') for name in existing_zip.namelist())
+
+        # 4GB未満の書庫では allowZip64=False に設定し、追記による途中切り替えキメラ化を防ぐ
+        use_zip64 = False
+        if os.path.exists(zip_path) and os.path.getsize(zip_path) >= 4000 * 1024 * 1024:
+            use_zip64 = True
 
         # 'a' (Append) モードでZIPを開く。ファイルが無い場合は自動作成される。
-        with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_DEFLATED) as zipf:
+        with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_DEFLATED, allowZip64=use_zip64) as zipf:
             for root, _, files in os.walk(author_dir):
                 for file in files:
                     file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, author_dir)
+                    # パス区切り文字を必ずフォワードスラッシュに正規化して書き込む
+                    arcname = os.path.relpath(file_path, author_dir).replace('\\', '/')
                     if arcname in existing_names:
                         if log_callback:
                             log_callback(f"Zip内に同名ファイルが既に存在するためスキップします: {arcname}", "DEBUG")
@@ -87,6 +179,10 @@ def append_to_zip(author_dir: str, zip_path: str, log_callback=None):
         shutil.rmtree(author_dir)
         if log_callback:
             log_callback(f"Zip化が完了し、一時フォルダを削除しました。", "INFO")
+
+        # 追記後に、書庫サイズやキメラ化の有無を点検し、必要であれば自動正規化を実施
+        normalize_zip_for_compatibility(zip_path, log_callback)
+
     except Exception as e:
         if log_callback:
             log_callback(f"Zip化に失敗しました: {e}", "ERROR")
