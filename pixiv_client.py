@@ -2,6 +2,8 @@ import time
 import random
 import logging
 import re
+import threading
+import hashlib
 from typing import List, Dict, Any, Callable
 
 import requests
@@ -644,8 +646,10 @@ class PixivClient:
                 os.replace(tmp_path, save_path)
                 
                 logger.info(f"画像の保存に成功しました: {os.path.basename(save_path)}")
+                # ダウンロード成功時にバックグラウンドでサムネイルを作成してキャッシュ保存
+                threading.Thread(target=self.create_and_cache_thumbnail, args=(save_path,), daemon=True).start()
                 return
-                
+
             except (requests.RequestException, ValueError, Exception) as e:
                 if os.path.exists(tmp_path):
                     try:
@@ -775,3 +779,49 @@ class PixivClient:
                     logger.error(f"サムネイル画像の取得に失敗しました: {e}")
                     return None
                 time.sleep(1)
+
+    def create_and_cache_thumbnail(self, image_path: str, size=(300, 300)) -> bytes:
+        """ローカル画像ファイルからサムネイルを生成し、キャッシュディレクトリに保存してバイトデータを返します。"""
+        import os
+        if not image_path or not os.path.exists(image_path):
+            return None
+
+        path_hash = hashlib.md5((os.path.abspath(image_path) + f"_{size[0]}x{size[1]}").encode('utf-8')).hexdigest() + "_local.jpg"
+        cache_file = os.path.join(self._cache_dir, path_hash)
+
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    data = f.read()
+                if data:
+                    return data
+            except Exception:
+                pass
+
+        try:
+            from PIL import Image
+            import io
+            with Image.open(image_path) as img:
+                img.thumbnail(size)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=80)
+                data = buf.getvalue()
+                try:
+                    with open(cache_file, 'wb') as f:
+                        f.write(data)
+                except Exception:
+                    pass
+                return data
+        except Exception as e:
+            logger.debug(f"サムネイル生成エラー ({image_path}): {e}")
+            return None
+
+    def get_thumbnail_base64_from_path(self, image_path: str, size=(300, 300)) -> str:
+        """ローカル画像ファイルからサムネイルのBase64文字列を取得します。"""
+        import base64
+        data = self.create_and_cache_thumbnail(image_path, size)
+        if data:
+            return base64.b64encode(data).decode('utf-8')
+        return None

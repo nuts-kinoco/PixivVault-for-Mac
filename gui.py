@@ -978,6 +978,28 @@ def main_window(page: ft.Page):
         except Exception as e:
             logger.error(f"保存フォルダを開けませんでした: {e}")
 
+    def open_author_folder(folder_path):
+        import subprocess
+        import sys
+        if not folder_path or not os.path.exists(folder_path):
+            page.show_dialog(ft.SnackBar(ft.Text("対象の保存フォルダが見つかりません。"), bgcolor=ft.Colors.RED_700))
+            page.update()
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder_path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder_path])
+            else:
+                subprocess.Popen(["xdg-open", folder_path])
+        except Exception as e:
+            logger.error(f"保存フォルダを開けませんでした: {e}")
+
+    history_btn = ft.IconButton(
+        icon=ft.Icons.HISTORY, tooltip="直近のバックアップ",
+        on_click=lambda _: on_tab_change(6)
+    )
+
     open_folder_btn = ft.IconButton(
         icon=ft.Icons.FOLDER_OPEN, tooltip="保存フォルダを開く",
         on_click=open_save_folder
@@ -1458,6 +1480,250 @@ def main_window(page: ft.Page):
         failed_list_view
     ], expand=True)
 
+    # --- 直近のバックアップ（作者別画像グリッド） ---
+    backup_history_grid = ft.GridView(
+        expand=True,
+        max_extent=160,
+        child_aspect_ratio=1.0,
+        spacing=10,
+        run_spacing=10,
+    )
+
+    def load_backup_history_ui():
+        # 空にした直後に一度 update() しておくことで、タブが可視化された直後の
+        # レイアウトパス（GridView の幅/列数計算）を確定させる。ここを省略すると
+        # スレッド側の初回 append がまだ幅0のまま計算された GridView に対して
+        # 行われ、以後の更新でも高さ0のまま描画されないことがある(Flet 0.85.3)。
+        backup_history_grid.controls.clear()
+        backup_history_grid.update()
+
+        def _load_history_thread():
+            base_img_dir = db.get_setting("save_path", "Images")
+            try:
+                cursor = db.conn.execute("""
+                    SELECT w.user_id, fu.name as following_name, MAX(w.last_backup) as max_backup
+                    FROM works w
+                    LEFT JOIN following_users fu ON w.user_id = fu.user_id
+                    WHERE w.last_backup IS NOT NULL
+                    GROUP BY w.user_id
+                    ORDER BY max_backup DESC
+                    LIMIT 60
+                """)
+                rows = cursor.fetchall()
+            except Exception as e:
+                append_log(f"直近バックアップ履歴取得エラー: {e}", color=ft.Colors.RED_400)
+                return
+
+            if not rows:
+                append_log("直近バックアップ履歴: 対象データがありません（works.last_backupが未設定）。", color=ft.Colors.GREY_400)
+                return
+
+            import glob
+            import re
+            import zipfile
+
+            # 1リクエストごとに毎回生成すると無駄でエラー源にもなるため、ループの外で1回だけ生成する
+            try:
+                client_tmp = PixivClient(db=db)
+            except Exception as e:
+                append_log(f"直近バックアップ履歴: PixivClient初期化エラー: {e}", color=ft.Colors.RED_400)
+                return
+
+            def make_click_handler(target_dir):
+                return lambda _: open_author_folder(target_dir)
+
+            cards = []
+            skipped_no_dir = 0
+            skipped_no_image = 0
+
+            for row in rows:
+                user_id = row['user_id']
+                following_name = row['following_name']
+
+                # 作者フォルダは「ZIPアーカイブ化(auto_archive/zip_all_after_download)」が
+                # 有効な場合、ダウンロード直後に append_to_zip() でフォルダごと削除され
+                # "作者名(ID).zip" のみが残る運用のため、フォルダとZIPの両方を探索する。
+                author_dir = None
+                author_dir_name = None
+                zip_path = None
+                try:
+                    if os.path.exists(base_img_dir):
+                        dirs = glob.glob(os.path.join(base_img_dir, f"*({user_id})"))
+                        if dirs:
+                            author_dir = dirs[0]
+                            author_dir_name = os.path.basename(author_dir)
+                            zip_candidate = author_dir + ".zip"
+                            if os.path.exists(zip_candidate):
+                                zip_path = zip_candidate
+                        else:
+                            zips = glob.glob(os.path.join(base_img_dir, f"*({user_id}).zip"))
+                            if zips:
+                                zip_path = zips[0]
+                                author_dir_name = os.path.basename(zip_path)[:-4]
+                except Exception as e:
+                    append_log(f"直近バックアップ履歴: フォルダ検索エラー(user_id={user_id}): {e}", color=ft.Colors.RED_400)
+                    continue
+
+                if not author_dir and not zip_path:
+                    skipped_no_dir += 1
+                    continue
+
+                display_name = following_name
+                if not display_name and author_dir_name:
+                    match = re.match(r"^(.*?)\(\d+\)$", author_dir_name)
+                    if match:
+                        display_name = match.group(1)
+                if not display_name:
+                    display_name = f"ユーザー({user_id})"
+
+                valid_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+                found_images = []
+                if author_dir:
+                    try:
+                        for root_dir, _, files in os.walk(author_dir):
+                            for file in files:
+                                ext = os.path.splitext(file)[1].lower()
+                                if ext in valid_exts:
+                                    full_path = os.path.join(root_dir, file)
+                                    try:
+                                        mtime = os.path.getmtime(full_path)
+                                        found_images.append((full_path, mtime))
+                                    except OSError:
+                                        pass
+                    except Exception as e:
+                        append_log(f"直近バックアップ履歴: 画像探索エラー({author_dir}): {e}", color=ft.Colors.RED_400)
+                        continue
+
+                b64_data = None
+                if found_images:
+                    found_images.sort(key=lambda x: x[1], reverse=True)
+                    img_path = found_images[0][0]
+                    try:
+                        b64_data = client_tmp.get_thumbnail_base64_from_path(img_path, size=(300, 300))
+                    except Exception as e:
+                        append_log(f"直近バックアップ履歴: サムネイル生成エラー({img_path}): {e}", color=ft.Colors.RED_400)
+                elif zip_path:
+                    # フォルダに画像が無い(=ZIP化済みで削除された)場合、ZIP内の最新の画像を直接読み込む
+                    try:
+                        with zipfile.ZipFile(zip_path, 'r') as zf:
+                            zip_images = [
+                                info for info in zf.infolist()
+                                if os.path.splitext(info.filename)[1].lower() in valid_exts
+                            ]
+                            if zip_images:
+                                zip_images.sort(key=lambda i: i.date_time, reverse=True)
+                                raw = zf.read(zip_images[0].filename)
+                                from PIL import Image
+                                import io
+                                with Image.open(io.BytesIO(raw)) as img:
+                                    img.thumbnail((300, 300))
+                                    if img.mode in ("RGBA", "P"):
+                                        img = img.convert("RGB")
+                                    buf = io.BytesIO()
+                                    img.save(buf, format="JPEG", quality=80)
+                                    b64_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+                    except Exception as e:
+                        append_log(f"直近バックアップ履歴: ZIP内画像読み込みエラー({zip_path}): {e}", color=ft.Colors.RED_400)
+
+                if not b64_data:
+                    skipped_no_image += 1
+                    continue
+
+                open_target = author_dir or zip_path
+
+                # 作者名バー（最初は opacity=0 で非表示。height を明示して
+                # opacity=0 でもレイアウト領域が確保された状態を保つ）
+                name_container = ft.Container(
+                    content=ft.Text(
+                        display_name,
+                        size=11,
+                        weight=ft.FontWeight.BOLD,
+                        color=ft.Colors.WHITE,
+                        max_lines=2,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        text_align=ft.TextAlign.CENTER
+                    ),
+                    alignment=ft.alignment.Alignment.CENTER,
+                    padding=5,
+                    height=34,
+                    bgcolor=ft.Colors.with_opacity(0.6, ft.Colors.BLACK),
+                    border_radius=ft.BorderRadius.only(bottom_left=10, bottom_right=10),
+                    bottom=0,
+                    left=0,
+                    right=0,
+                    opacity=0,
+                    animate_opacity=200,
+                )
+
+                def make_hover_handler(target_name_container):
+                    def _hover(e):
+                        target_name_container.opacity = 1 if e.data == "true" else 0
+                        # Stack の奥にある対象コントロール自身を直接 update する
+                        # （ジェスチャ元コントロールを update しても子の変更が
+                        # 確実に反映されない場合があるため）
+                        target_name_container.update()
+                    return _hover
+
+                # ヒットテストを確実にするため、Stack 全体を GestureDetector で
+                # ラップして on_hover / on_tap を検出する（Container.on_hover は
+                # Stack 内に Positioned な子要素が重なると判定が不安定になることがある）
+                card = ft.Container(
+                    width=140,
+                    height=140,
+                    border_radius=10,
+                    bgcolor="#23272A",
+                    clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                    tooltip=f"{display_name} ({user_id})\nクリックして開く",
+                    content=ft.GestureDetector(
+                        mouse_cursor=ft.MouseCursor.CLICK,
+                        on_tap=make_click_handler(open_target),
+                        on_hover=make_hover_handler(name_container),
+                        content=ft.Stack(
+                            [
+                                ft.Image(
+                                    src=f"data:image/jpeg;base64,{b64_data}",
+                                    width=140,
+                                    height=140,
+                                    fit=ft.BoxFit.COVER,
+                                ),
+                                name_container,
+                            ],
+                            width=140,
+                            height=140,
+                        ),
+                    ),
+                )
+                cards.append(card)
+
+                # 進捗表示のため10件ごとに反映（page.update()ではなくコントロール単位のupdate()を使い、
+                # 別スレッドからのUI更新をこのGridViewに限定してレースを避ける）
+                if len(cards) % 10 == 0:
+                    backup_history_grid.controls = list(cards)
+                    backup_history_grid.update()
+
+            backup_history_grid.controls = cards
+            backup_history_grid.update()
+
+            if cards:
+                append_log(f"直近のバックアップ: {len(cards)}件のタイルを表示しました。", color=ft.Colors.GREEN_400)
+            else:
+                append_log(
+                    f"直近のバックアップ: 表示できるタイルがありませんでした "
+                    f"(フォルダ/ZIP未検出:{skipped_no_dir}件 / 画像なし:{skipped_no_image}件)。",
+                    color=ft.Colors.ORANGE_400
+                )
+
+        page.run_thread(_load_history_thread)
+
+    tab_backup_history_content = ft.Column([
+        ft.Row([
+            ft.Text("直近のバックアップ", size=20, weight=ft.FontWeight.BOLD),
+            ft.IconButton(ft.Icons.REFRESH, tooltip="更新", on_click=lambda _: load_backup_history_ui())
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        ft.Divider(),
+        backup_history_grid
+    ], expand=True)
+
     # --- タブ切り替え ---
 
     tab1_container = ft.Container(content=tab1_content, padding=10, visible=True)
@@ -1466,10 +1732,11 @@ def main_window(page: ft.Page):
     tab_queue_container = ft.Container(content=tab_queue_content, padding=10, visible=False, expand=True)
     tab_failed_container = ft.Container(content=tab_failed_content, padding=10, visible=False, expand=True)
     tab_extension_container = ft.Container(content=tab_extension_content, padding=10, visible=False)
+    tab_backup_history_container = ft.Container(content=tab_backup_history_content, padding=10, visible=False, expand=True)
 
-    tab_containers = [tab1_container, tab2_container, tab_bookmark_container, tab_queue_container, tab_failed_container, tab_extension_container]
+    tab_containers = [tab1_container, tab2_container, tab_bookmark_container, tab_queue_container, tab_failed_container, tab_extension_container, tab_backup_history_container]
     tab_buttons = []
-    
+
     def on_tab_change(idx):
         if idx == 99:
             open_save_folder()
@@ -1477,14 +1744,25 @@ def main_window(page: ft.Page):
 
         for i, container in enumerate(tab_containers):
             container.visible = (i == idx)
-        
+
         for btn in tab_buttons:
             if btn.data != 99:
                 btn.style = ft.ButtonStyle(
                     color=ft.Colors.BLUE_400 if btn.data == idx else ft.Colors.GREY_400,
                     bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.BLUE) if btn.data == idx else ft.Colors.TRANSPARENT,
                 )
+
+        history_btn.icon_color = ft.Colors.BLUE_400 if idx == 6 else None
+        log_container.visible = (idx != 6)
+
+        # 可視化の更新を先に確定させてから、直近バックアップグリッドへの
+        # データ投入を開始する。同時に行うと GridView がまだ幅0のまま
+        # レイアウトされ、以後のスレッド側 update() でも高さ0のまま
+        # 描画されないことがあるため(Flet 0.85.3)、順序を分離する。
         page.update()
+
+        if idx == 6:
+            load_backup_history_ui()
 
     def create_tab_btn(idx, label, icon):
         btn = ft.TextButton(
@@ -1518,7 +1796,7 @@ def main_window(page: ft.Page):
                 ft.Text("PixivVault", size=32, weight=ft.FontWeight.BOLD),
                 login_status_text,
             ]),
-            ft.Row([open_folder_btn, settings_btn], spacing=5)
+            ft.Row([history_btn, open_folder_btn, settings_btn], spacing=5)
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         custom_tab_bar,
         tab1_container,
@@ -1527,6 +1805,7 @@ def main_window(page: ft.Page):
         tab_queue_container,
         tab_failed_container,
         tab_extension_container,
+        tab_backup_history_container,
         log_container
     )
 
