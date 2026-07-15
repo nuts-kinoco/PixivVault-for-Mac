@@ -17,13 +17,10 @@ def send_notification(title: str, message: str, app_id: str = "PixivVault") -> N
         except Exception as e:
             logger.error(f"通知の送信に失敗しました(Windows): {e}")
     elif sys.platform == "darwin":
-        def _escape(s: str) -> str:
-            return s.replace("\\", "\\\\").replace('"', '\\"')
-
-        script = f'display notification "{_escape(message)}" with title "{_escape(title)}"'
+        script = 'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run'
         try:
             subprocess.run(
-                ["osascript", "-e", script],
+                ["osascript", "-e", script, title, message],
                 check=True,
                 timeout=5,
                 capture_output=True,

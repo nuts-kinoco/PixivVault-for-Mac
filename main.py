@@ -12,6 +12,11 @@ from logging.handlers import RotatingFileHandler
 # 実行ファイル(またはスクリプト)が存在するフォルダにカレントディレクトリを強制変更します。
 if getattr(sys, 'frozen', False):
     app_path = os.path.dirname(os.path.abspath(sys.executable))
+    if sys.platform == "darwin" and "Contents/MacOS" in app_path:
+        # macOSの.appバンドル内から起動された場合、リソースフォルダは書き込み適さないため、
+        # ユーザーのApplication Support配下に作業ディレクトリを変更します。
+        app_path = os.path.expanduser("~/Library/Application Support/PixivVault")
+        os.makedirs(app_path, exist_ok=True)
 else:
     app_path = os.path.dirname(os.path.abspath(sys.argv[0]))
 os.chdir(app_path)
@@ -46,8 +51,13 @@ def ensure_branded_flet_desktop_client():
         if not os.path.isdir(app_bundle) or os.path.exists(marker):
             return
 
-        if hasattr(sys, '_MEIPASS'):
-            icon_src = os.path.join(sys._MEIPASS, 'assets', 'icon.icns')
+        if getattr(sys, 'frozen', False):
+            # onefile: sys._MEIPASS, onedir: sys._MEIPASS or executable dir
+            base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
+            icon_src = os.path.join(base_path, 'assets', 'icon.icns')
+            # If not found in _MEIPASS (onedir can have assets next to executable)
+            if not os.path.exists(icon_src):
+                icon_src = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'assets', 'icon.icns')
         else:
             icon_src = os.path.join(os.path.abspath("."), 'assets', 'icon.icns')
 
@@ -112,8 +122,12 @@ def main():
 
     import sys
     def get_asset_path(filename):
-        if hasattr(sys, '_MEIPASS'):
-            return os.path.join(sys._MEIPASS, 'assets', filename)
+        if getattr(sys, 'frozen', False):
+            base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
+            path = os.path.join(base_path, 'assets', filename)
+            if not os.path.exists(path):
+                path = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'assets', filename)
+            return path
         return os.path.join(os.path.abspath("."), 'assets', filename)
 
     def app_target(page: ft.Page):

@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import tkinter as tk
 from tkinter import filedialog
@@ -991,13 +992,18 @@ def main_window(page: ft.Page):
     ext_status_text = ft.Text("未登録", color=ft.Colors.GREY_400, weight=ft.FontWeight.BOLD)
     
     def update_ext_status():
-        is_registered = registry_helper.check_protocol_registered()
-        if is_registered:
-            ext_status_text.value = "有効（レジストリ登録済み）"
+        import sys
+        if sys.platform != "win32":
+            ext_status_text.value = "有効（macOSのURLスキームで自動解決されます）"
             ext_status_text.color = ft.Colors.GREEN_400
         else:
-            ext_status_text.value = "無効（レジストリ未登録）"
-            ext_status_text.color = ft.Colors.GREY_400
+            is_registered = registry_helper.check_protocol_registered()
+            if is_registered:
+                ext_status_text.value = "有効（レジストリ登録済み）"
+                ext_status_text.color = ft.Colors.GREEN_400
+            else:
+                ext_status_text.value = "無効（レジストリ未登録）"
+                ext_status_text.color = ft.Colors.GREY_400
         page.update()
 
     def on_register_ext(e):
@@ -1036,8 +1042,8 @@ def main_window(page: ft.Page):
             border_radius=8
         ),
         ft.Row([
-            ft.ElevatedButton("自動起動を有効化", icon=ft.Icons.CHECK, color=ft.Colors.WHITE, bgcolor=ft.Colors.BLUE_600, on_click=on_register_ext),
-            ft.OutlinedButton("自動起動を無効化", icon=ft.Icons.CLOSE, on_click=on_unregister_ext),
+            ft.ElevatedButton("自動起動を有効化", icon=ft.Icons.CHECK, color=ft.Colors.WHITE, bgcolor=ft.Colors.BLUE_600, on_click=on_register_ext, disabled=(sys.platform != "win32")),
+            ft.OutlinedButton("自動起動を無効化", icon=ft.Icons.CLOSE, on_click=on_unregister_ext, disabled=(sys.platform != "win32")),
         ]),
     ], spacing=10)
     

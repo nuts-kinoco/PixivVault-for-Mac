@@ -1,11 +1,15 @@
-import pystray
 from PIL import Image, ImageDraw
 import os
 import sys
+import logging
 
 def get_asset_path(filename):
-    if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, 'assets', filename)
+    if getattr(sys, 'frozen', False):
+        base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(sys.executable)))
+        path = os.path.join(base_path, 'assets', filename)
+        if not os.path.exists(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'assets', filename)
+        return path
     return os.path.join(os.path.abspath("."), 'assets', filename)
 
 def create_image():
@@ -24,6 +28,12 @@ def create_image():
     return image
 
 def run_tray(on_show_clicked, on_exit_clicked):
+    try:
+        import pystray
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"システムトレイの初期化に失敗しました。この環境ではサポートされていない可能性があります。: {e}")
+        return None
+
     def on_show(icon, item):
         on_show_clicked()
 
