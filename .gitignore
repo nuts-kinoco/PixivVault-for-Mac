@@ -1,0 +1,27 @@
+# Python related
+__pycache__/
+*.pyc
+
+# PixivVault User Data (DO NOT UPLOAD)
+cookies.txt
+pixiv_vault.db
+Images/
+*.zip
+*.tmp
+
+# Build Artifacts
+build/
+dist/
+# main.spec is hand-maintained (cross-platform PyInstaller config) and is tracked intentionally.
+
+# Logs / cache / dev exports
+cache/
+*.log
+gui_error_log.txt
+failed_queue_export.csv
+.pytest_cache/
+
+# OS junk
+.DS_Store
+Thumbs.db
+prompt.txt

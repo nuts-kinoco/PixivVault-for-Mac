@@ -1,0 +1,63 @@
+/* PixivVault Extension Styles */
+
+.pixiv-vault-btn {
+    background-color: #0096fa;
+    color: white;
+    border: none;
+    border-radius: 999px;
+    padding: 8px 16px;
+    font-size: 14px;
+    font-weight: bold;
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    transition: background-color 0.2s, transform 0.1s;
+    font-family: inherit;
+    z-index: 9999;
+}
+
+.pixiv-vault-btn:hover {
+    background-color: #007acd;
+}
+
+.pixiv-vault-btn:active {
+    transform: scale(0.95);
+}
+
+.pixiv-vault-btn:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* 画面右下に固定するスタイル（Artwork, Novel用） */
+.pv-floating-btn {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 12px 24px;
+    font-size: 16px;
+    box-shadow: 0 4px 12px rgba(0, 150, 250, 0.4);
+}
+
+/* ユーザー一覧用（小さめ） */
+.pv-small-btn {
+    padding: 4px 8px;
+    font-size: 12px;
+    margin-left: 8px;
+    background-color: #666;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+.pv-small-btn:hover {
+    background-color: #444;
+}
+
+/* 成功・エラー状態 */
+.pv-success {
+    background-color: #4caf50 !important;
+}
+
+.pv-error {
+    background-color: #f44336 !important;
+}

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "PixivVault",
+  "version": "1.0",
+  "description": "PixivからPixivVaultへ直接ダウンロード指示を送る拡張機能です",
+  "permissions": [
+    "cookies",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:25010/*",
+    "https://*.pixiv.net/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.pixiv.net/*"],
+      "js": ["content.js"],
+      "css": ["style.css"]
+    }
+  ]
+}

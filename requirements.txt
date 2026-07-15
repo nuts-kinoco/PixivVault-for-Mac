@@ -1,0 +1,8 @@
+pystray
+win11toast; sys_platform == "win32"
+pyobjc-framework-Cocoa; sys_platform == "darwin"
+schedule
+Pillow
+flet==0.85.3
+flet-desktop==0.85.3
+requests
