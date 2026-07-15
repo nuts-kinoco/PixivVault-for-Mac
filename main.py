@@ -180,7 +180,9 @@ def main():
                 )
                 page.show_dialog(confirm_dialog)
             elif e.type == ft.WindowEventType.MINIMIZE:
-                if db.get_setting("minimize_to_tray", "1") == "1":
+                # トレイアイコンが利用できない環境(pystray初期化失敗)では、最小化で隠すと
+                # ウィンドウを復元する手段が無くなり操作不能になるため、_tray_icon がある場合のみ隠す。
+                if _tray_icon and db.get_setting("minimize_to_tray", "1") == "1":
                     page.window.visible = False
                     page.update()
         
