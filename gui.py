@@ -1050,6 +1050,7 @@ def main_window(page: ft.Page):
             if hasattr(ctrl, "color") and ctrl.color:
                 ctrl.color = get_adjusted_color(ctrl.color)
 
+        update_ext_status()
         page.update()
 
     theme_toggle_btn = ft.IconButton(
@@ -1087,7 +1088,7 @@ def main_window(page: ft.Page):
                 ext_status_text.color = ft.Colors.GREEN_400
             else:
                 ext_status_text.value = "無効（レジストリ未登録）"
-            ext_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
+                ext_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
         page.update()
 
     def on_register_ext(e):
@@ -1578,7 +1579,7 @@ def main_window(page: ft.Page):
                 return
 
             if not rows:
-                append_log("直近バックアップ履歴: 対象データがありません（works.last_backupが未設定）。", color=get_adjusted_color(ft.Colors.GREY_400))
+                append_log("直近バックアップ履歴: 対象データがありません（works.last_backupが未設定）。", color=ft.Colors.GREY_400)
                 return
 
             import glob

@@ -109,7 +109,7 @@ def normalize_zip_for_compatibility(zip_path: str, log_callback=None):
         if not needs_normalize:
             return
 
-        # 4 GiB (4,000,000,000 bytes) 未満であれば allowZip64=False を厳格に指定し、
+        # 約3.9 GiB (4000*1024*1024 = 4,194,304,000 bytes) 未満であれば allowZip64=False を厳格に指定し、
         # 前半が標準32bit・後半がZip64となるキメラ状態を完全に回避した純粋32bit書庫にする
         use_zip64 = (size >= 4000 * 1024 * 1024)
         if log_callback:
