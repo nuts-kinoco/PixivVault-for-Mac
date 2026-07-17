@@ -30,8 +30,6 @@ def main_window(page: ft.Page):
     page.theme_mode = ft.ThemeMode.DARK
     page.theme = ft.Theme(color_scheme_seed="#0096FA")
     page.dark_theme = ft.Theme(color_scheme_seed="#0096FA")
-    page.window.width = 800
-    page.window.height = 600
 
     db = Database()
 
@@ -87,7 +85,7 @@ def main_window(page: ft.Page):
             top=ft.BorderSide(1, ft.Colors.OUTLINE), bottom=ft.BorderSide(1, ft.Colors.OUTLINE),
             left=ft.BorderSide(1, ft.Colors.OUTLINE), right=ft.BorderSide(1, ft.Colors.OUTLINE),
         ),
-        border_radius=5, padding=10, expand=True, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST
+        border_radius=5, padding=10, height=140, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST
     )
 
     list_expanded = [False]
@@ -205,6 +203,9 @@ def main_window(page: ft.Page):
         if not user_id:
             append_log("ユーザーIDを入力してください。", color=ft.Colors.ERROR)
             return
+        if not user_id.isdigit():
+            append_log("ユーザーIDは数字のみ入力してください (PixivのユーザーページURLの末尾の数字です)。", color=ft.Colors.ERROR)
+            return
         if not os.path.exists("cookies.txt"):
             handle_alert("cookies.txt が見つかりません。設定ボタンからインポートしてください。")
             return
@@ -261,6 +262,13 @@ def main_window(page: ft.Page):
         margin=ft.margin.Margin(left=-10, top=5, right=0, bottom=0)
     )
 
+    batch_summary_card = None  # 後の行で実体を代入する
+
+    def hide_batch_summary(e=None):
+        if batch_summary_card is not None and batch_summary_card.visible:
+            batch_summary_card.visible = False
+            page.update()
+
     batch_target_type_dropdown = ft.Dropdown(
         label="対象", width=160,
         options=[
@@ -270,9 +278,11 @@ def main_window(page: ft.Page):
         ],
         value="both"
     )
-    
+    batch_target_type_dropdown.on_change = lambda e: hide_batch_summary()
+
 
     def clear_search_field(e):
+        hide_batch_summary()
         search_field.value = ""
         search_field.update()
         load_follow_list_ui(search_val_override="")
@@ -308,8 +318,8 @@ def main_window(page: ft.Page):
         ],
         value="asc"
     )
-    sort_by_dropdown.on_select    = lambda e: load_follow_list_ui()
-    sort_order_dropdown.on_select = lambda e: load_follow_list_ui()
+    sort_by_dropdown.on_select    = lambda e: (hide_batch_summary(), load_follow_list_ui())
+    sort_order_dropdown.on_select = lambda e: (hide_batch_summary(), load_follow_list_ui())
 
     batch_run_btn    = ft.ElevatedButton("一括ダウンロード実行", icon=ft.Icons.PLAY_ARROW)
     batch_pause_btn  = ft.ElevatedButton("一時停止", icon=ft.Icons.PAUSE, disabled=True)
@@ -337,8 +347,6 @@ def main_window(page: ft.Page):
             users = [u for u in users if search_q in (u.get('name') or '').lower() or search_q in str(u.get('user_id', '')).lower()]
         
         follow_count_text.value = str(len(users))
-        
-        append_log(f"[システム] リスト更新: 検索='{search_q}', 件数={len(users)}")
 
         def toggle_zip(e, uid):
             btn = e.control
@@ -364,10 +372,14 @@ def main_window(page: ft.Page):
                 label += f" [最終: {u['last_downloaded'][:10]}]"
                 
             # 退避しておいた選択状態を復元（デフォルトは False）
-            cb = ft.Checkbox(value=saved_states.get(u['user_id'], False))
+            cb = ft.Checkbox(
+                value=saved_states.get(u['user_id'], False),
+                on_change=lambda e: hide_batch_summary()
+            )
             follow_checkboxes[u['user_id']] = cb
-            
+
             def on_label_tap(e, cb_ref=cb):
+                hide_batch_summary()
                 cb_ref.value = not cb_ref.value
                 page.update()
                 
@@ -468,7 +480,7 @@ def main_window(page: ft.Page):
         follow_list_view.update()
         page.update()
         
-    search_field.on_change  = lambda e: load_follow_list_ui(search_val_override=e.control.value)
+    search_field.on_change  = lambda e: (hide_batch_summary(), load_follow_list_ui(search_val_override=e.control.value))
 
     def set_ui_disabled_batch(disabled: bool, is_running: bool = False):
         batch_run_btn.disabled    = disabled
@@ -521,10 +533,18 @@ def main_window(page: ft.Page):
     batch_summary_text = ft.Row(spacing=10, wrap=True)
     batch_summary_card = ft.Container(
         content=ft.Row([
-            ft.Icon(ft.Icons.ANALYTICS, color=ft.Colors.BLUE_400),
-            ft.Text("実行結果サマリー: ", weight=ft.FontWeight.BOLD),
-            batch_summary_text
-        ], wrap=True),
+            ft.Row([
+                ft.Icon(ft.Icons.ANALYTICS, color=ft.Colors.BLUE_400),
+                ft.Text("実行結果サマリー: ", weight=ft.FontWeight.BOLD),
+                batch_summary_text
+            ], spacing=10, wrap=True, expand=True),
+            ft.IconButton(
+                icon=ft.Icons.CLOSE,
+                icon_size=18,
+                tooltip="サマリーを閉じる",
+                on_click=hide_batch_summary
+            )
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         bgcolor=ft.Colors.SURFACE_CONTAINER,
         padding=10,
         border_radius=8,
@@ -601,10 +621,11 @@ def main_window(page: ft.Page):
 
     batch_pause_btn.on_click = on_batch_pause
     batch_stop_btn.on_click  = lambda _: batch_stop_event.set()
-    select_all_btn.on_click   = lambda _: [setattr(cb, 'value', True) for cb in follow_checkboxes.values()] or page.update()
-    deselect_all_btn.on_click = lambda _: [setattr(cb, 'value', False) for cb in follow_checkboxes.values()] or page.update()
-    
+    select_all_btn.on_click   = lambda _: hide_batch_summary() or [setattr(cb, 'value', True) for cb in follow_checkboxes.values()] or page.update()
+    deselect_all_btn.on_click = lambda _: hide_batch_summary() or [setattr(cb, 'value', False) for cb in follow_checkboxes.values()] or page.update()
+
     def on_select_favorite(e):
+        hide_batch_summary()
         favs = [str(u['user_id']) for u in db.get_favorite_users()]
         for uid, cb in follow_checkboxes.items():
             cb.value = str(uid) in favs
@@ -716,7 +737,7 @@ def main_window(page: ft.Page):
                 cookie_status_text.value = "[完了] cookies.txt をインポートしました。"
                 cookie_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
                 cookie_status_text.visible = True
-                threading.Thread(target=check_login_status, daemon=True).start()
+                threading.Thread(target=lambda: check_login_status(on_cookie_imported=True), daemon=True).start()
             else:
                 cookie_status_text.value = "キャンセルされました。"
                 cookie_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
@@ -816,7 +837,7 @@ def main_window(page: ft.Page):
     auto_check_dropdown.on_change = on_auto_check_interval_change
 
     def on_enable_notifications_change(e):
-        db.set_setting("enable_notifications", "1" if e.control.value == "1" else "0")
+        db.set_setting("enable_notifications", e.control.value)
 
     notifications_dropdown = ft.Dropdown(
         label="新着通知のON/OFF",
@@ -975,7 +996,7 @@ def main_window(page: ft.Page):
             api_retry_wait_dropdown,
             advanced_settings,
             ft.Row([
-                ft.Text("v3.0 build260715", size=11, color=ft.Colors.GREY_600)
+                ft.Text("v3.0 build260717", size=11, color=ft.Colors.GREY_600)
             ], alignment=ft.MainAxisAlignment.CENTER),
             ft.Row([
                 ft.TextButton("閉じる", on_click=lambda _: page.pop_dialog())
@@ -1073,22 +1094,85 @@ def main_window(page: ft.Page):
         on_click=open_settings_dialog
     )
 
+    def open_pixiv_in_browser(e=None):
+        import webbrowser
+        webbrowser.open("https://www.pixiv.net/")
+        append_log("ブラウザで Pixiv を開きました。PV拡張機能をお使いの場合、ページを開くと自動で Cookie が連携・更新されます。", color=ft.Colors.BLUE_300)
+
+    cookie_picker_btn = ft.IconButton(
+        icon=ft.Icons.PUBLIC,
+        tooltip="ブラウザで Pixiv を開く (ログイン状態確認・自動連携)",
+        on_click=open_pixiv_in_browser
+    )
+
+    def close_cookie_banner(e=None):
+        cookie_banner.visible = False
+        cookie_banner.update()
+
+    cookie_banner = ft.Container(
+        content=ft.Row([
+            ft.Icon(ft.Icons.INFO_OUTLINE, color=ft.Colors.BLUE_400),
+            ft.Column([
+                ft.Text("【Cookie未連携】", weight=ft.FontWeight.BOLD, size=14, color=ft.Colors.ON_SURFACE),
+                ft.Text("PV拡張機能をご利用中の場合、cookies.txtの手動DLは不要です。\nブラウザでPixivを開くだけで自動的に連携されます。", size=13, color=ft.Colors.ON_SURFACE_VARIANT),
+            ], expand=True, spacing=2),
+            ft.ElevatedButton("Pixivを開く", icon=ft.Icons.OPEN_IN_BROWSER, on_click=open_pixiv_in_browser),
+            ft.IconButton(ft.Icons.CLOSE, tooltip="閉じる", on_click=close_cookie_banner),
+        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        padding=10,
+        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+        border=ft.Border(
+            top=ft.BorderSide(1, ft.Colors.BLUE_400), bottom=ft.BorderSide(1, ft.Colors.BLUE_400),
+            left=ft.BorderSide(1, ft.Colors.BLUE_400), right=ft.BorderSide(1, ft.Colors.BLUE_400),
+        ),
+        border_radius=8,
+        visible=False,
+    )
+
     # --- 拡張機能タブ ---
-    ext_status_text = ft.Text("未登録", color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.BOLD)
-    
+
+    # 状態アイコン・テキスト（update_ext_status で書き換える）
+    ext_status_icon    = ft.Icon(ft.Icons.HELP_OUTLINE, color=ft.Colors.ON_SURFACE_VARIANT, size=28)
+    ext_status_label   = ft.Text("確認中...", size=16, weight=ft.FontWeight.BOLD, color=ft.Colors.ON_SURFACE_VARIANT)
+    ext_status_detail  = ft.Text("", size=13, color=ft.Colors.ON_SURFACE_VARIANT)
+
+    # 登録・解除ボタン
+    ext_register_btn   = ft.ElevatedButton(
+        "有効化（レジストリ登録）", icon=ft.Icons.CHECK_CIRCLE_OUTLINE,
+        bgcolor=ft.Colors.BLUE_600, color=ft.Colors.WHITE,
+    )
+    ext_unregister_btn = ft.OutlinedButton(
+        "無効化（レジストリ解除）", icon=ft.Icons.REMOVE_CIRCLE_OUTLINE,
+    )
+
     def update_ext_status():
         import sys
         if sys.platform != "win32":
-            ext_status_text.value = "有効（macOSのURLスキームで自動解決されます）"
-            ext_status_text.color = ft.Colors.GREEN_400
+            ext_status_icon.name    = ft.Icons.CHECK_CIRCLE
+            ext_status_icon.color   = ft.Colors.GREEN_400
+            ext_status_label.value  = "有効  ─  macOSのURLスキームで自動解決されます"
+            ext_status_label.color  = ft.Colors.GREEN_400
+            ext_status_detail.value = "追加の登録操作は不要です。ブラウザ拡張機能からPixivVaultを自動起動できます。"
+            ext_register_btn.disabled   = True
+            ext_unregister_btn.disabled = True
         else:
             is_registered = registry_helper.check_protocol_registered()
             if is_registered:
-                ext_status_text.value = "有効（レジストリ登録済み）"
-                ext_status_text.color = ft.Colors.GREEN_400
+                ext_status_icon.name    = ft.Icons.CHECK_CIRCLE
+                ext_status_icon.color   = ft.Colors.GREEN_400
+                ext_status_label.value  = "有効  ─  自動起動は登録済みです"
+                ext_status_label.color  = ft.Colors.GREEN_400
+                ext_status_detail.value = "ブラウザ拡張機能からPixivVaultを自動で起動できる状態です。"
+                ext_register_btn.disabled   = True
+                ext_unregister_btn.disabled = False
             else:
-                ext_status_text.value = "無効（レジストリ未登録）"
-                ext_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
+                ext_status_icon.name    = ft.Icons.CANCEL
+                ext_status_icon.color   = ft.Colors.ON_SURFACE_VARIANT
+                ext_status_label.value  = "無効  ─  自動起動は未登録です"
+                ext_status_label.color  = ft.Colors.ON_SURFACE_VARIANT
+                ext_status_detail.value = "「有効化」ボタンを押すと、拡張機能からの自動起動が使えるようになります。"
+                ext_register_btn.disabled   = False
+                ext_unregister_btn.disabled = True
         page.update()
 
     def on_register_ext(e):
@@ -1105,33 +1189,64 @@ def main_window(page: ft.Page):
             page.show_dialog(ft.SnackBar(ft.Text("解除に失敗しました。"), bgcolor=ft.Colors.RED_700))
         update_ext_status()
 
+    ext_register_btn.on_click   = on_register_ext
+    ext_unregister_btn.on_click = on_unregister_ext
+
+    # 状態カード
+    ext_status_card = ft.Container(
+        content=ft.Row([
+            ext_status_icon,
+            ft.Column([
+                ext_status_label,
+                ext_status_detail,
+            ], spacing=2, expand=True),
+        ], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        padding=16,
+        border_radius=10,
+        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+        border=ft.Border(
+            top=ft.BorderSide(1, ft.Colors.OUTLINE),
+            bottom=ft.BorderSide(1, ft.Colors.OUTLINE),
+            left=ft.BorderSide(1, ft.Colors.OUTLINE),
+            right=ft.BorderSide(1, ft.Colors.OUTLINE),
+        ),
+    )
+
     tab_extension_content = ft.Column([
-        ft.Text("ブラウザ拡張機能 連携設定", size=20, weight=ft.FontWeight.BOLD),
-        ft.Divider(),
-        ft.Text("PixivVaultのブラウザ拡張機能を使うと、Pixivのページから直接ダウンロード指示を送ることができます。", size=14),
-        ft.Container(height=10),
-        ft.Text("現在の状態:", weight=ft.FontWeight.BOLD),
-        ext_status_text,
-        ft.Container(height=10),
+        # ── 上部：タイトル ──
+        ft.Text("ブラウザ拡張機能  連携設定", size=18, weight=ft.FontWeight.BOLD),
+        ft.Divider(height=8),
+        # ── 現在の状態カード ──
+        ft.Text("現在の状態", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.ON_SURFACE_VARIANT),
+        ext_status_card,
+        # ── 操作ボタン ──
+        ft.Row([ext_register_btn, ext_unregister_btn], spacing=12),
+        ft.Divider(height=8),
+        # ── 説明 ──
+        ft.Text(
+            "PixivVaultのブラウザ拡張機能を使うと、Pixivのページから直接ダウンロード指示を送ることができます。\n"
+            "Cookie は拡張機能が30分ごとに自動で同期します。Pixivを開くと即時同期されます。",
+            size=12, color=ft.Colors.ON_SURFACE_VARIANT
+        ),
+        # ── 注意事項（下部）──
         ft.Container(
             content=ft.Column([
-                ft.Text("⚠️ 自動起動について", weight=ft.FontWeight.BOLD, color=ft.Colors.ERROR),
+                ft.Row([
+                    ft.Icon(ft.Icons.WARNING_AMBER, color=ft.Colors.ERROR, size=16),
+                    ft.Text("自動起動について（注意）", weight=ft.FontWeight.BOLD, color=ft.Colors.ERROR, size=12),
+                ], spacing=4),
                 ft.Text(
-                    "アプリが起動していない時にボタンを押した場合、ブラウザから自動でこのアプリを起動することができます。\n"
-                    "この機能を有効にするには、Windowsのレジストリ（HKEY_CURRENT_USER）にカスタムURLスキームを書き込みます。",
-                    size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500
+                    "有効にすると、Windowsレジストリ（HKEY_CURRENT_USER）にカスタムURLスキームを書き込みます。\n"
+                    "アプリが未起動の状態で拡張機能ボタンを押した場合、自動でアプリを起動します。",
+                    size=12, color=ft.Colors.ON_SURFACE_VARIANT
                 ),
-            ]),
-            bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.ERROR),
+            ], spacing=4),
+            bgcolor=ft.Colors.with_opacity(0.10, ft.Colors.ERROR),
             padding=10,
-            border_radius=8
+            border_radius=8,
         ),
-        ft.Row([
-            ft.ElevatedButton("自動起動を有効化", icon=ft.Icons.CHECK, color=ft.Colors.WHITE, bgcolor=ft.Colors.BLUE_600, on_click=on_register_ext, disabled=(sys.platform != "win32")),
-            ft.OutlinedButton("自動起動を無効化", icon=ft.Icons.CLOSE, on_click=on_unregister_ext, disabled=(sys.platform != "win32")),
-        ]),
-    ], spacing=10)
-    
+    ], spacing=8)
+
     # 初期状態チェック
     update_ext_status()
 
@@ -1447,7 +1562,7 @@ def main_window(page: ft.Page):
             failed_list_view.controls.append(
                 ft.Container(
                     content=ft.Text("現在、失敗キューおよび品質異常の作品はありません ✅", color=ft.Colors.GREEN_300),
-                    padding=20
+                    padding=ft.padding.Padding(0, 5, 0, 5)
                 )
             )
         else:
@@ -1531,18 +1646,18 @@ def main_window(page: ft.Page):
 
     tab_failed_content = ft.Column([
         ft.Row([
-            ft.Text("ダウンロード失敗キュー・保存品質異常リスト", size=20, weight=ft.FontWeight.BOLD),
+            ft.Text("ダウンロード失敗キュー・保存品質異常リスト", size=18, weight=ft.FontWeight.BOLD),
             ft.IconButton(ft.Icons.REFRESH, tooltip="リスト更新", on_click=lambda _: load_failed_queue_ui()),
         ]),
-        ft.Text("通信エラーや品質異常（0バイト/破損等）が発生した作品一覧です。再試行やCSVエクスポートが行えます。", size=13, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
+        ft.Text("通信エラーや品質異常（0バイト/破損等）が発生した作品一覧です。再試行やCSVエクスポートが行えます。", size=12, color=ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.W_500),
         ft.Row([
             ft.ElevatedButton("全件再試行", icon=ft.Icons.PLAY_ARROW, color=ft.Colors.WHITE, bgcolor=ft.Colors.BLUE_600, on_click=on_retry_all_failed),
             ft.OutlinedButton("CSV出力", icon=ft.Icons.FILE_DOWNLOAD, on_click=on_export_failed_csv),
             ft.OutlinedButton("全件クリア", icon=ft.Icons.DELETE_OUTLINE, on_click=on_clear_all_failed),
         ]),
-        ft.Divider(),
+        ft.Divider(height=8),
         failed_list_view
-    ], expand=True)
+    ], expand=True, spacing=8)
 
     # --- 直近のバックアップ（作者別画像グリッド） ---
     backup_history_grid = ft.GridView(
@@ -1790,7 +1905,7 @@ def main_window(page: ft.Page):
 
     # --- タブ切り替え ---
 
-    tab1_container = ft.Container(content=tab1_content, padding=10, visible=True)
+    tab1_container = ft.Container(content=tab1_content, padding=10, visible=True, expand=True)
     tab2_container = ft.Container(content=tab2_content, padding=10, visible=False, expand=True)
     tab_bookmark_container = ft.Container(content=tab_bookmark_content, padding=10, visible=False, expand=True)
     tab_queue_container = ft.Container(content=tab_queue_content, padding=10, visible=False, expand=True)
@@ -1820,7 +1935,8 @@ def main_window(page: ft.Page):
                 )
 
         history_btn.icon_color = ft.Colors.PRIMARY if idx == 6 else None
-        log_container.visible = (idx != 6)
+        # 拡張機能タブ(idx=5)と直近バックアップタブ(idx=6)ではログを非表示
+        log_container.visible = (idx not in [5, 6])
 
         # 可視化の更新を先に確定させてから、直近バックアップグリッドへの
         # データ投入を開始する。同時に行うと GridView がまだ幅0のまま
@@ -1860,11 +1976,14 @@ def main_window(page: ft.Page):
     page.add(
         ft.Row([
             ft.Column([
-                ft.Text("PixivVault", size=32, weight=ft.FontWeight.BOLD),
+                ft.Row([
+                    ft.Text("PixivVault", size=32, weight=ft.FontWeight.BOLD),
+                ]),
                 login_status_text,
             ]),
-            ft.Row([history_btn, open_folder_btn, theme_toggle_btn, settings_btn], spacing=5)
+            ft.Row([history_btn, open_folder_btn, theme_toggle_btn, cookie_picker_btn, settings_btn], spacing=5)
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        cookie_banner,
         custom_tab_bar,
         tab1_container,
         tab2_container,
@@ -1903,27 +2022,65 @@ def main_window(page: ft.Page):
             append_log("起動時フォローリスト自動同期を開始します...", color=ft.Colors.BLUE_300)
             threading.Thread(target=run_auto_sync_thread, args=(my_id,), daemon=True).start()
 
-    def check_login_status():
+    def check_login_status(on_cookie_imported=False, auto_retried=False):
+        old_user_id = db.get_setting("my_user_id", "")
         status_info = PixivClient.check_cookie_status("cookies.txt")
         st = status_info.get("status", "expired")
         msg = status_info.get("message", "")
         uid = status_info.get("user_id")
+        days_left = status_info.get("days_left", 0)
+
+        # 起動時など、期限切れや1週間以下(黄色・赤色)でまだ自動更新試行していなければ、裏で全自動抽出にトライ！
+        if (st == "expired" or st in ["warning_yellow", "warning_red", "warning"]) and not on_cookie_imported and not auto_retried:
+            append_log("Cookie有効期限チェック: ブラウザ (Chrome/Edge/Firefox) から最新Cookieの全自動抽出を試行します...", color=ft.Colors.BLUE_300)
+            try:
+                auto_info = PixivClient.auto_extract_browser_cookies("cookies.txt")
+                auto_st = auto_info.get("status", "expired")
+                if auto_st in ["valid", "warning_yellow", "warning_red"]:
+                    status_info = auto_info
+                    st = auto_st
+                    msg = auto_info.get("message", "")
+                    uid = auto_info.get("user_id")
+                    days_left = auto_info.get("days_left", 0)
+                    append_log(f"ブラウザ ({auto_info.get('browser')}) からの Cookie 自動抽出・更新に成功しました！", color=ft.Colors.GREEN_400)
+                    on_cookie_imported = True
+                else:
+                    append_log("ブラウザからの自動抽出を試みましたが、有効なセッションが見つかりませんでした。ブラウザでPixivへログインし、ページを開くと自動で連携されます。", color=ft.Colors.ON_SURFACE_VARIANT)
+            except Exception as ex:
+                logger.debug(f"自動抽出エラー: {ex}")
 
         if st == "valid":
             login_status_text.value = f"● [有効] {msg}"
             login_status_text.color = ft.Colors.GREEN_400
-            if uid:
-                db.set_setting("my_user_id", str(uid))
-                trigger_auto_sync(uid)
-        elif st == "warning":
-            login_status_text.value = f"▲ [期限切れ間近] {msg}"
-            login_status_text.color = ft.Colors.ERROR
-            if uid:
-                db.set_setting("my_user_id", str(uid))
-                trigger_auto_sync(uid)
+            cookie_banner.visible = False
+        elif st == "warning_yellow":
+            login_status_text.value = f"▲ [注意/残り1週間以内] {msg}"
+            login_status_text.color = ft.Colors.YELLOW_400
+            cookie_banner.visible = False
+        elif st in ["warning", "warning_red"]:
+            login_status_text.value = f"▲ [警告/残り3日以内] {msg}"
+            login_status_text.color = ft.Colors.RED_400
+            cookie_banner.visible = False
         else:
             login_status_text.value = f"× [未認証/期限切れ] {msg}"
             login_status_text.color = ft.Colors.RED_400
+            cookie_banner.visible = True
+
+        if uid and st in ["valid", "warning_yellow", "warning_red", "warning"]:
+            if str(uid) != str(old_user_id) and str(old_user_id) != "":
+                # 別アカウントのCookieに切り替わった場合のみ全削除・再同期
+                append_log(f"別アカウント(ID: {uid})のCookieを読み込みました。旧フォロー中データを削除・再取得します。", color=ft.Colors.ORANGE_400)
+                db.clear_following_users()
+                db.set_setting("my_user_id", str(uid))
+                threading.Thread(target=sync_follow_list, daemon=True).start()
+            elif on_cookie_imported:
+                # 同アカウントのCookie更新・確認時は全削除せずに差分同期のみ行う
+                append_log("Cookie を確認・更新しました。", color=ft.Colors.GREEN_400)
+                db.set_setting("my_user_id", str(uid))
+                trigger_auto_sync(uid)
+            else:
+                db.set_setting("my_user_id", str(uid))
+                trigger_auto_sync(uid)
         page.update()
 
     # 初期化

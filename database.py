@@ -164,6 +164,11 @@ class Database:
         cursor = self.conn.execute(f"SELECT * FROM following_users ORDER BY {column} {direction}")
         return [dict(row) for row in cursor.fetchall()]
 
+    def clear_following_users(self):
+        """保存されているフォローユーザー一覧をすべてクリア（削除）します"""
+        with self.conn:
+            self.conn.execute("DELETE FROM following_users")
+
     def update_following_last_downloaded(self, user_id):
         """特定のフォローユーザーの最終ダウンロード日時を更新します"""
         now = datetime.now().isoformat()

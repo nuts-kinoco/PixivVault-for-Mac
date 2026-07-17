@@ -86,88 +86,383 @@ class PixivClient:
     @classmethod
     def check_cookie_status(cls, cookie_file: str = "cookies.txt") -> dict:
         """Cookieファイルの状態と有効期限を検証します。
-        
+
         戻り値:
-            status: "valid" | "warning" | "expired" | "missing"
+            status: "valid" | "warning_yellow" | "warning_red" | "expired" | "missing"
             message: 表示用メッセージ
-            expires_at: 最も早いセッションCookieの有効期限日時 (ISO string または None)
+            expires_at: セッションCookieの有効期限日時 (ISO string または None)
             user_id: ログイン中ユーザーID (取得できた場合)
+            days_left: 有効期限までの残り日数
         """
         import os
         import http.cookiejar
         from datetime import datetime
-        
+
         if not os.path.exists(cookie_file):
             return {
                 "status": "missing",
                 "message": "cookies.txt が見つかりません。設定からインポートしてください。",
                 "expires_at": None,
-                "user_id": None
+                "user_id": None,
+                "days_left": 0
             }
-        
+
         try:
             cj = http.cookiejar.MozillaCookieJar(cookie_file)
             cj.load(ignore_discard=True, ignore_expires=True)
-            
+
             pixiv_cookies = [c for c in cj if 'pixiv.net' in c.domain]
             if not pixiv_cookies:
                 return {
                     "status": "expired",
                     "message": "cookies.txt にPixivのCookieが含まれていません。",
                     "expires_at": None,
-                    "user_id": None
+                    "user_id": None,
+                    "days_left": 0
                 }
-            
-            min_expires = None
-            for c in pixiv_cookies:
-                if c.name == 'PHPSESSID' or (c.expires and c.expires > 0):
-                    if c.expires and c.expires > 0:
-                        if min_expires is None or c.expires < min_expires:
-                            min_expires = c.expires
-            
+
+            # ログインセッションの核である PHPSESSID を優先取得（関係ないトラッキングCookieの期限切れで判定しない）
+            phpsessid = next((c for c in pixiv_cookies if c.name == 'PHPSESSID'), None)
+            target_expires = None
+            if phpsessid and phpsessid.expires and phpsessid.expires > 0:
+                target_expires = phpsessid.expires
+            else:
+                # PHPSESSID に有効期限がない場合は他の主要セッションCookieの中で最大の有効期限を使用
+                valid_expires = [c.expires for c in pixiv_cookies if c.expires and c.expires > 0 and c.name not in ['_cfuvid', '_ga', 'g_state']]
+                if valid_expires:
+                    target_expires = max(valid_expires)
+
             now_ts = time.time()
-            expires_iso = datetime.fromtimestamp(min_expires).isoformat() if min_expires else None
-            
-            if min_expires and min_expires < now_ts:
-                return {
-                    "status": "expired",
-                    "message": "Cookieの有効期限が切れています。再インポートしてください。",
-                    "expires_at": expires_iso,
-                    "user_id": None
-                }
-            
+            expires_iso = datetime.fromtimestamp(target_expires).isoformat() if target_expires else None
+
+            # 実際のAPIでログインが有効かテスト（確実な検証）
             client = cls()
             user_id = client.get_my_user_id()
             if not user_id:
                 return {
                     "status": "expired",
-                    "message": "ログインセッションが無効化されています。再インポートしてください。",
+                    "message": "ログインセッションが無効化されています。またはCookieの有効期限が切れています。",
                     "expires_at": expires_iso,
-                    "user_id": None
+                    "user_id": None,
+                    "days_left": 0
                 }
-            
-            if min_expires and (min_expires - now_ts) < 86400 * 7:
-                days_left = max(1, int((min_expires - now_ts) / 86400))
+
+            # API認証成功時の残り日数計算
+            import math
+            if target_expires and target_expires > now_ts:
+                days_left = max(1, int(math.ceil((target_expires - now_ts) / 86400)))
+            else:
+                # APIは通るが有効期限タイムスタンプが過去/未設定のセッションCookieの場合、デフォルト有効扱い
+                days_left = 30
+
+            # 残り8日以上なら緑(valid)、残り4日～7日(1週間)なら黄色(warning_yellow)、残り3日以下で赤(warning_red)
+            if days_left > 7:
                 return {
-                    "status": "warning",
-                    "message": f"Cookie期限切れ間近 (残り約{days_left}日) - ID: {user_id}",
+                    "status": "valid",
+                    "message": f"ログイン中 (有効期限 残り約{days_left}日) - ユーザーID: {user_id}",
                     "expires_at": expires_iso,
-                    "user_id": str(user_id)
+                    "user_id": str(user_id),
+                    "days_left": days_left
                 }
-            
-            return {
-                "status": "valid",
-                "message": f"ログイン中 - ユーザーID: {user_id}",
-                "expires_at": expires_iso,
-                "user_id": str(user_id)
-            }
+            elif days_left > 3:
+                return {
+                    "status": "warning_yellow",
+                    "message": f"Cookie有効期限 残り約{days_left}日 (1週間以内/黄色アラート) - ID: {user_id}",
+                    "expires_at": expires_iso,
+                    "user_id": str(user_id),
+                    "days_left": days_left
+                }
+            else:
+                return {
+                    "status": "warning_red",
+                    "message": f"Cookie有効期限 残り約{days_left}日 (3日以内/赤色アラート) - ID: {user_id}",
+                    "expires_at": expires_iso,
+                    "user_id": str(user_id),
+                    "days_left": days_left
+                }
         except Exception as e:
             return {
                 "status": "expired",
                 "message": f"Cookie検証失敗または期限切れ ({str(e)})",
                 "expires_at": None,
-                "user_id": None
+                "user_id": None,
+                "days_left": 0
             }
+
+    @classmethod
+    def _extract_cookies_native(cls, browser_name: str) -> List[dict]:
+        """OS標準の資格情報ストアを使った Chrome/Edge/Brave の暗号化 Cookie 抽出エンジン
+        (Windows: pycryptodome + win32crypt / DPAPI、macOS: pycryptodome + Keychain)"""
+        import sys
+        import os
+        import shutil
+        import sqlite3
+        import tempfile
+
+        if sys.platform == "win32":
+            import json
+            import base64
+            try:
+                import win32crypt
+                from Crypto.Cipher import AES
+            except ImportError:
+                return []
+
+            local_app_data = os.environ.get('LOCALAPPDATA', '')
+            profiles = {
+                "Chrome": os.path.join(local_app_data, r"Google\Chrome\User Data"),
+                "Edge": os.path.join(local_app_data, r"Microsoft\Edge\User Data"),
+                "Brave": os.path.join(local_app_data, r"BraveSoftware\Brave-Browser\User Data")
+            }
+
+            user_data_dir = profiles.get(browser_name)
+            if not user_data_dir or not os.path.exists(user_data_dir):
+                return []
+
+            # 1. マスターキーの復元
+            local_state_path = os.path.join(user_data_dir, "Local State")
+            if not os.path.exists(local_state_path):
+                return []
+
+            try:
+                with open(local_state_path, "r", encoding="utf-8") as f:
+                    local_state = json.load(f)
+                encrypted_key_b64 = local_state.get("os_crypt", {}).get("encrypted_key")
+                if not encrypted_key_b64:
+                    return []
+                encrypted_key = base64.b64decode(encrypted_key_b64)
+                if encrypted_key.startswith(b"DPAPI"):
+                    encrypted_key = encrypted_key[5:]
+                master_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+            except Exception as ex:
+                logger.debug(f"{browser_name} キー復元エラー: {ex}")
+                return []
+
+            def _decrypt(enc_val: bytes) -> str:
+                if enc_val.startswith(b"v10") or enc_val.startswith(b"v20"):
+                    nonce = enc_val[3:15]
+                    ciphertext = enc_val[15:-16]
+                    tag = enc_val[-16:]
+                    cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                    return cipher.decrypt_and_verify(ciphertext, tag).decode('utf-8')
+                return win32crypt.CryptUnprotectData(enc_val, None, None, None, 0)[1].decode('utf-8')
+
+            # 2. 各プロファイルの Cookies データベースから pixiv.net 関連のレコードを解読
+            search_profiles = ["Default"] + [f"Profile {i}" for i in range(1, 10)]
+            profile_dirs = [(prof, os.path.join(user_data_dir, prof)) for prof in search_profiles]
+
+        elif sys.platform == "darwin":
+            try:
+                from Crypto.Cipher import AES
+                from Crypto.Protocol.KDF import PBKDF2
+            except ImportError:
+                return []
+
+            keychain_info = {
+                "Chrome": ("Chrome Safe Storage", "Chrome"),
+                "Edge": ("Microsoft Edge Safe Storage", "Microsoft Edge"),
+                "Brave": ("Brave Safe Storage", "Brave"),
+            }.get(browser_name)
+            if not keychain_info:
+                return []
+            service, account = keychain_info
+
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["security", "find-generic-password", "-w", "-a", account, "-s", service],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    return []
+                safe_storage_password = result.stdout.strip()
+            except Exception as ex:
+                logger.debug(f"{browser_name} Keychainアクセスエラー: {ex}")
+                return []
+
+            master_key = PBKDF2(safe_storage_password, b'saltysalt', dkLen=16, count=1003)
+            iv = b' ' * 16
+
+            def _decrypt(enc_val: bytes) -> str:
+                if enc_val[:3] not in (b"v10", b"v11"):
+                    raise ValueError("unsupported cookie encryption prefix")
+                cipher = AES.new(master_key, AES.MODE_CBC, iv)
+                decrypted = cipher.decrypt(enc_val[3:])
+                pad_len = decrypted[-1]
+                return decrypted[:-pad_len].decode('utf-8')
+
+            home = os.path.expanduser("~")
+            profiles_root = {
+                "Chrome": os.path.join(home, "Library/Application Support/Google/Chrome"),
+                "Edge": os.path.join(home, "Library/Application Support/Microsoft Edge"),
+                "Brave": os.path.join(home, "Library/Application Support/BraveSoftware/Brave-Browser"),
+            }.get(browser_name)
+            if not profiles_root or not os.path.exists(profiles_root):
+                return []
+
+            search_profiles = ["Default"] + [f"Profile {i}" for i in range(1, 10)]
+            profile_dirs = [(prof, os.path.join(profiles_root, prof)) for prof in search_profiles]
+
+        else:
+            return []
+
+        found_cookies = []
+
+        for prof, prof_dir in profile_dirs:
+            db_path = os.path.join(prof_dir, "Network", "Cookies")
+            if not os.path.exists(db_path):
+                db_path = os.path.join(prof_dir, "Cookies")
+            if not os.path.exists(db_path):
+                continue
+
+            temp_db = os.path.join(tempfile.gettempdir(), f"pixiv_cookies_{browser_name}_{prof}.db")
+            try:
+                shutil.copy2(db_path, temp_db)
+                conn = sqlite3.connect(temp_db)
+                cursor = conn.cursor()
+                cursor.execute("SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure FROM cookies WHERE host_key LIKE '%pixiv%'")
+                rows = cursor.fetchall()
+                conn.close()
+                os.remove(temp_db)
+
+                for host, name, val, enc_val, path, expires_utc, is_secure in rows:
+                    value = val
+                    if not value and enc_val:
+                        try:
+                            value = _decrypt(enc_val)
+                        except Exception:
+                            continue
+
+                    if value:
+                        if expires_utc and expires_utc > 0:
+                            expires_unix = int((expires_utc / 1000000) - 11644473600)
+                        else:
+                            expires_unix = int(time.time() + 86400 * 30)
+
+                        found_cookies.append({
+                            "domain": host,
+                            "name": name,
+                            "value": value,
+                            "path": path,
+                            "expires": expires_unix,
+                            "secure": bool(is_secure)
+                        })
+            except Exception as ex:
+                logger.debug(f"{browser_name} ({prof}) 解読エラー: {ex}")
+                continue
+
+        return found_cookies
+
+    @classmethod
+    def auto_extract_browser_cookies(cls, target_file: str = "cookies.txt") -> dict:
+        """主要ブラウザ (Chrome, Edge, Firefox, Brave) から Pixiv の Cookie を全自動抽出して Netscape 形式で保存します"""
+        import sys, os, glob, sqlite3, tempfile, shutil
+        browsers = ["Chrome", "Edge", "Brave"]
+        extracted_cookies = None
+        used_browser = ""
+
+        # 1. Chrome, Edge, Brave のネイティブ解読
+        for b_name in browsers:
+            c_list = cls._extract_cookies_native(b_name)
+            if c_list and any(c.get('name') == 'PHPSESSID' for c in c_list):
+                extracted_cookies = c_list
+                used_browser = b_name
+                break
+
+        # 2. Firefox の探索（暗号化無しで格納されている cookies.sqlite から取得）
+        if not extracted_cookies:
+            if sys.platform == "win32":
+                app_data = os.environ.get('APPDATA', '')
+                ff_glob_pattern = os.path.join(app_data, r"Mozilla\Firefox\Profiles\*\cookies.sqlite")
+            elif sys.platform == "darwin":
+                ff_glob_pattern = os.path.expanduser("~/Library/Application Support/Firefox/Profiles/*/cookies.sqlite")
+            else:
+                ff_glob_pattern = os.path.expanduser("~/.mozilla/firefox/*/cookies.sqlite")
+
+            ff_profiles = glob.glob(ff_glob_pattern)
+            for ff_db in ff_profiles:
+                try:
+                    temp_ff = os.path.join(tempfile.gettempdir(), "ff_cookies_temp.sqlite")
+                    shutil.copy2(ff_db, temp_ff)
+                    conn = sqlite3.connect(temp_ff)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT host, name, value, path, expiry, isSecure FROM moz_cookies WHERE host LIKE '%pixiv%'")
+                    ff_rows = cursor.fetchall()
+                    conn.close()
+                    os.remove(temp_ff)
+
+                    ff_list = []
+                    for host, name, val, path, expiry, isSecure in ff_rows:
+                        if val:
+                            ff_list.append({
+                                "domain": host,
+                                "name": name,
+                                "value": val,
+                                "path": path,
+                                "expires": int(expiry) if expiry else int(time.time() + 86400 * 30),
+                                "secure": bool(isSecure)
+                            })
+                    if ff_list and any(c.get('name') == 'PHPSESSID' for c in ff_list):
+                        extracted_cookies = ff_list
+                        used_browser = "Firefox"
+                        break
+                except Exception as ex:
+                    logger.debug(f"Firefox Cookie 抽出エラー: {ex}")
+
+        if not extracted_cookies:
+            return {
+                "status": "expired",
+                "message": "Chrome/Edge/Firefox 等のブラウザから Pixiv ログイン Cookie (PHPSESSID) の自動解読ができませんでした。普段お使いのブラウザで Pixiv にログイン後 [Cookie更新] を押すか、右上の [拡張機能] より cookies.txt を保存してください。",
+                "expires_at": None,
+                "user_id": None,
+                "days_left": 0
+            }
+
+        # Netscape 形式へ保存
+        try:
+            with open(target_file, "w", encoding="utf-8") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                f.write(f"# Generated automatically by PixivVault (from {used_browser})\n\n")
+                for c in extracted_cookies:
+                    if isinstance(c, dict):
+                        domain = c.get('domain', '.pixiv.net')
+                        name = c.get('name', '')
+                        value = c.get('value', '')
+                        path = c.get('path', '/')
+                        expires = c.get('expires', 0)
+                        secure = c.get('secure', True)
+                    else:
+                        domain = getattr(c, 'domain', '.pixiv.net')
+                        name = getattr(c, 'name', '')
+                        value = getattr(c, 'value', '')
+                        path = getattr(c, 'path', '/')
+                        expires = getattr(c, 'expires', 0)
+                        secure = getattr(c, 'secure', True)
+
+                    if not domain.startswith('.'):
+                        domain = '.' + domain
+
+                    if not expires or expires <= 0:
+                        expires = int(time.time() + 86400 * 30)
+                    else:
+                        expires = int(expires)
+
+                    secure_str = "TRUE" if secure else "FALSE"
+                    f.write(f"{domain}\tTRUE\t{path}\t{secure_str}\t{expires}\t{name}\t{value}\n")
+        except Exception as e:
+            return {
+                "status": "expired",
+                "message": f"Cookie ファイル ({target_file}) への自動書き込みに失敗しました: {e}",
+                "expires_at": None,
+                "user_id": None,
+                "days_left": 0
+            }
+
+        res = cls.check_cookie_status(target_file)
+        if res.get("status") in ["valid", "warning_yellow", "warning_red"]:
+            res["message"] = f"[{used_browser}より自動取得] " + res["message"]
+            res["browser"] = used_browser
+        return res
 
     def _request_with_retry(self, url: str, params: dict = None, max_retries: int = None, method: str = 'GET', data: dict = None) -> dict:
         """APIリクエストを送信し、エラー時・429時は設定に基づき再試行します。"""
@@ -199,6 +494,15 @@ class PixivClient:
                     error_msg = response_data.get('message', '不明なエラー')
                     logger.error(f"Pixiv APIからエラーが返ってきました: {error_msg}")
                     raise Exception(f"Pixiv APIエラー: {error_msg}")
+
+                # 通信完了時、セッションのCookieを cookies.txt へ自動同期・延長保存
+                try:
+                    if hasattr(self, 'cj') and self.cj:
+                        for c in self.session.cookies:
+                            self.cj.set_cookie(c)
+                        self.cj.save(ignore_discard=True, ignore_expires=True)
+                except Exception:
+                    pass
 
                 return response_data
             

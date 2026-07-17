@@ -132,11 +132,14 @@ def main():
 
     def app_target(page: ft.Page):
         # 画面サイズの設定 (16:9比率)
-        page.window.width = 1152
-        page.window.height = 648
+        page.window.width = 800
+        page.window.height = 600
         # ウィンドウのタイトルバー・タスクバーに適用するアイコンアセットを指定
         page.window.icon = get_asset_path("icon.ico" if sys.platform == "win32" else "icon.png")
-        
+
+        # ウィンドウのリサイズ制限（最大化・最小化のみ許可）
+        page.window.resizable = False
+
         # メインUIの構築
         main_window(page)
         
