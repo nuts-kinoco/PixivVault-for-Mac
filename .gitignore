@@ -1,6 +1,7 @@
 # Python related
 __pycache__/
 *.pyc
+.venv/
 
 # PixivVault User Data (DO NOT UPLOAD)
 cookies.txt
