@@ -12,8 +12,64 @@ from database import Database
 from core import run_backup, export_data, run_batch_backup, download_bookmarks, get_unfollowed_bookmark_authors, run_single_work_backup
 import registry_helper
 import base64
+import time
 
 logger = logging.getLogger(__name__)
+
+
+class _EtaTimer:
+    """残り時間を1秒ごとにカウントダウン表示するためのタイマー。
+    core.py のコールバックが届くたびに eta_sec を補正し、
+    独立したデーモンスレッドが毎秒 r_text を更新する。"""
+
+    def __init__(self, r_text: "ft.Text", page: "ft.Page"):
+        self._r_text = r_text
+        self._page = page
+        self._eta_sec: float = -1.0   # -1 = まだ計算できていない
+        self._running = False
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    # コールバックから ETA を更新（race-free）
+    def update_eta(self, eta_sec: float):
+        with self._lock:
+            self._eta_sec = max(0.0, eta_sec)
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        while self._running:
+            time.sleep(1)
+            if not self._running:
+                break
+            with self._lock:
+                eta = self._eta_sec
+                if eta >= 0:
+                    self._eta_sec = max(0.0, eta - 1)
+
+            if eta < 0:
+                self._r_text.value = "残り時間計算中..."
+            elif eta == 0:
+                self._r_text.value = ""
+            else:
+                mins, secs = divmod(int(eta), 60)
+                hrs, mins = divmod(mins, 60)
+                if hrs > 0:
+                    self._r_text.value = f"残り約{hrs}時間{mins}分{secs}秒"
+                elif mins > 0:
+                    self._r_text.value = f"残り約{mins}分{secs}秒"
+                else:
+                    self._r_text.value = f"残り約{secs}秒"
+            try:
+                self._page.update()
+            except Exception:
+                pass
 
 gui_log_callback = [None]
 gui_queue_log_callback = [None]
@@ -149,37 +205,46 @@ def main_window(page: ft.Page):
     remaining_time_text = ft.Text("", size=13, color=ft.Colors.PRIMARY, weight=ft.FontWeight.W_500)
 
     progress_history = []
+    # 個別DL / ブックマークDL ごとに独立した EtaTimer を持つ（同時実行時の混線防止）
+    _single_eta_timer: _EtaTimer | None = None
+    _bm_eta_timer:     _EtaTimer | None = None
 
-    def handle_progress(current: int, total: int, elapsed_sec: float = 0, p_bar=progress_bar, p_text=progress_text, r_text=remaining_time_text, history=None):
-        # history未指定時は個別DL(タブ1)用のリストを使う。ブックマークDLなど別フローは
-        # 専用のリストを渡すことで、同時実行時にETA計算が混線しないようにする。
+    def _calc_eta(history: list, current: int, total: int, elapsed_sec: float) -> float:
+        """直近の進捗履歴からETA（秒）を計算して返す。計算不能なら -1.0。"""
+        if elapsed_sec <= 0 or current >= total:
+            return -1.0
+        history.append((current, elapsed_sec))
+        if len(history) > 10:
+            history.pop(0)
+        if len(history) >= 2:
+            items_done = history[-1][0] - history[0][0]
+            time_taken = history[-1][1] - history[0][1]
+            if time_taken > 0 and items_done > 0:
+                speed = items_done / time_taken
+                return (total - current) / speed
+        return -1.0
+
+    def handle_progress(current: int, total: int, elapsed_sec: float = 0,
+                        p_bar=progress_bar, p_text=progress_text, r_text=remaining_time_text,
+                        history=None, eta_timer_ref: list | None = None):
+        """個別DL・ブックマークDL 共用の進捗コールバック。
+        eta_timer_ref には [_EtaTimer インスタンスまたは None] を格納したリストを渡す。
+        """
+        nonlocal _single_eta_timer, _bm_eta_timer
         if history is None:
             history = progress_history
+        # eta_timer_ref 未指定時は個別DLタイマーを使う
+        if eta_timer_ref is None:
+            eta_timer_ref = [_single_eta_timer]
+
         p_bar.value = current / total if total > 0 else 0
         p_text.value = f"{current} / {total}"
 
-        if elapsed_sec > 0 and current < total:
-            history.append((current, elapsed_sec))
-            if len(history) > 10:
-                history.pop(0)
+        eta = _calc_eta(history, current, total, elapsed_sec)
+        if eta >= 0 and eta_timer_ref[0] is not None:
+            eta_timer_ref[0].update_eta(eta)
 
-            if len(history) >= 2:
-                items_done = history[-1][0] - history[0][0]
-                time_taken = history[-1][1] - history[0][1]
-                if time_taken > 0 and items_done > 0:
-                    speed = items_done / time_taken
-                    remaining_items = total - current
-                    eta_sec = remaining_items / speed
-                    mins, secs = divmod(int(eta_sec), 60)
-                    if mins > 0:
-                        r_text.value = f"残り約{mins}分{secs}秒"
-                    else:
-                        r_text.value = f"残り約{secs}秒"
-                else:
-                    r_text.value = "残り時間計算中..."
-            else:
-                r_text.value = "残り時間計算中..."
-        elif current == total:
+        if current == total:
             r_text.value = ""
             history.clear()
 
@@ -199,6 +264,7 @@ def main_window(page: ft.Page):
         page.update()
 
     def run_backup_thread():
+        nonlocal _single_eta_timer
         user_id = user_id_field.value.strip()
         if not user_id:
             append_log("ユーザーIDを入力してください。", color=ft.Colors.ERROR)
@@ -220,6 +286,8 @@ def main_window(page: ft.Page):
         single_pause_event.clear()
         set_ui_disabled_single(True, is_running=True)
         _set_flow_active("single", True)
+        _single_eta_timer = _EtaTimer(remaining_time_text, page)
+        _single_eta_timer.start()
 
         try:
             client = PixivClient()
@@ -235,6 +303,9 @@ def main_window(page: ft.Page):
             else:
                 handle_alert(f"エラー: {e}")
         finally:
+            if _single_eta_timer is not None:
+                _single_eta_timer.stop()
+                _single_eta_timer = None
             progress_bar.visible = False
             progress_text.visible = False
             remaining_time_text.value = ""
@@ -498,33 +569,18 @@ def main_window(page: ft.Page):
         page.update()
 
     batch_progress_history = []
+    _batch_eta_timer: _EtaTimer | None = None
 
     def handle_batch_progress(idx: int, total: int, user_id: str, elapsed_sec: float = 0):
+        nonlocal _batch_eta_timer
         batch_progress_bar.value  = idx / total if total > 0 else 0
         batch_progress_text.value = f"作者 {idx} / {total}"
-        
-        if elapsed_sec > 0 and idx < total:
-            batch_progress_history.append((idx, elapsed_sec))
-            if len(batch_progress_history) > 5:
-                batch_progress_history.pop(0)
-                
-            if len(batch_progress_history) >= 2:
-                items_done = batch_progress_history[-1][0] - batch_progress_history[0][0]
-                time_taken = batch_progress_history[-1][1] - batch_progress_history[0][1]
-                if time_taken > 0 and items_done > 0:
-                    speed = items_done / time_taken
-                    remaining_items = total - idx
-                    eta_sec = remaining_items / speed
-                    mins, secs = divmod(int(eta_sec), 60)
-                    if mins > 0:
-                        batch_remaining_time_text.value = f"残り約{mins}分{secs}秒"
-                    else:
-                        batch_remaining_time_text.value = f"残り約{secs}秒"
-                else:
-                    batch_remaining_time_text.value = "残り時間計算中..."
-            else:
-                batch_remaining_time_text.value = "残り時間計算中..."
-        elif idx == total:
+
+        eta = _calc_eta(batch_progress_history, idx, total, elapsed_sec)
+        if eta >= 0 and _batch_eta_timer is not None:
+            _batch_eta_timer.update_eta(eta)
+
+        if idx == total:
             batch_remaining_time_text.value = ""
             batch_progress_history.clear()
 
@@ -556,6 +612,7 @@ def main_window(page: ft.Page):
     )
 
     def run_batch_thread():
+        nonlocal _batch_eta_timer
         selected_ids = [uid for uid, cb in follow_checkboxes.items() if cb.value]
         if not selected_ids:
             append_log("ダウンロードする作者を選択してください。", color=ft.Colors.ERROR)
@@ -572,6 +629,8 @@ def main_window(page: ft.Page):
         batch_pause_event.clear()
         set_ui_disabled_batch(True, is_running=True)
         _set_flow_active("batch", True)
+        _batch_eta_timer = _EtaTimer(batch_remaining_time_text, page)
+        _batch_eta_timer.start()
 
         try:
             client = PixivClient()
@@ -598,6 +657,9 @@ def main_window(page: ft.Page):
             else:
                 handle_alert(f"エラー: {e}")
         finally:
+            if _batch_eta_timer is not None:
+                _batch_eta_timer.stop()
+                _batch_eta_timer = None
             batch_progress_bar.visible  = False
             batch_progress_text.visible = False
             batch_remaining_time_text.value = ""
@@ -1314,13 +1376,14 @@ def main_window(page: ft.Page):
     bm_progress_text = ft.Text("0/0", visible=False)
     bm_remaining_time_text = ft.Text("", visible=True)
     bm_progress_history = []
+    _bm_eta_timer_ref: list = [None]  # [_EtaTimer | None] ブックマークDL用
 
     def run_bookmark_download_thread():
         my_user_id = db.get_setting("my_user_id", "")
         if not my_user_id:
             handle_alert("ログインチェックを完了してください。")
             return
-            
+
         bm_run_btn.disabled = True
         bm_pause_btn.disabled = False
         bm_stop_btn.disabled = False
@@ -1330,6 +1393,9 @@ def main_window(page: ft.Page):
         _set_flow_active("bookmark", True)
         bm_stop_event.clear()
         bm_pause_event.clear()
+        bm_eta = _EtaTimer(bm_remaining_time_text, page)
+        _bm_eta_timer_ref[0] = bm_eta
+        bm_eta.start()
         page.update()
 
         try:
@@ -1338,7 +1404,12 @@ def main_window(page: ft.Page):
                 db=db, client=client, my_user_id=my_user_id,
                 target_type=bm_target_type_dropdown.value,
                 rest_type=bm_rest_type_dropdown.value,
-                log_callback=append_log, progress_callback=lambda c, t, e: handle_progress(c, t, e, bm_progress_bar, bm_progress_text, bm_remaining_time_text, bm_progress_history),
+                log_callback=append_log,
+                progress_callback=lambda c, t, e: handle_progress(
+                    c, t, e, bm_progress_bar, bm_progress_text,
+                    bm_remaining_time_text, bm_progress_history,
+                    eta_timer_ref=_bm_eta_timer_ref
+                ),
                 alert_callback=handle_alert, stop_event=bm_stop_event, pause_event=bm_pause_event
             )
             append_log("--- ブックマーク一括DL完了 ---", color=ft.Colors.GREEN_400)
@@ -1348,6 +1419,9 @@ def main_window(page: ft.Page):
             else:
                 handle_alert(f"エラー: {e}")
         finally:
+            if _bm_eta_timer_ref[0] is not None:
+                _bm_eta_timer_ref[0].stop()
+                _bm_eta_timer_ref[0] = None
             bm_run_btn.disabled = False
             bm_pause_btn.disabled = True
             bm_stop_btn.disabled = True
