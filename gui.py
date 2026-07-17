@@ -22,9 +22,13 @@ class _EtaTimer:
     core.py のコールバックが届くたびに eta_sec を補正し、
     独立したデーモンスレッドが毎秒 r_text を更新する。"""
 
-    def __init__(self, r_text: "ft.Text", page: "ft.Page"):
+    def __init__(self, r_text: "ft.Text", page: "ft.Page", update_lock: "threading.Lock | None" = None):
         self._r_text = r_text
         self._page = page
+        # page.update() はスレッドセーフではなく、ダウンロードスレッド側の page.update() と
+        # 同時に呼ぶと "Frozen controls cannot be updated" になり得るため、呼び出し元と
+        # 同じロックを共有して直列化する。
+        self._update_lock = update_lock
         self._eta_sec: float = -1.0   # -1 = まだ計算できていない
         self._running = False
         self._lock = threading.Lock()
@@ -67,7 +71,11 @@ class _EtaTimer:
                 else:
                     self._r_text.value = f"残り約{secs}秒"
             try:
-                self._page.update()
+                if self._update_lock is not None:
+                    with self._update_lock:
+                        self._page.update()
+                else:
+                    self._page.update()
             except Exception:
                 pass
 
@@ -88,6 +96,19 @@ def main_window(page: ft.Page):
     page.dark_theme = ft.Theme(color_scheme_seed="#0096FA")
 
     db = Database()
+
+    # page.update() はスレッドセーフではないため、複数のバックグラウンドスレッド
+    # （ダウンロード処理・_EtaTimer 等）から同時に呼ぶと "Frozen controls cannot be
+    # updated" が発生し得る。すべての page.update() 呼び出しをこのロックで直列化する。
+    _ui_update_lock = threading.Lock()
+
+    def _safe_page_update():
+        with _ui_update_lock:
+            page.update()
+
+    def _safe_update(control):
+        with _ui_update_lock:
+            control.update()
 
     def get_adjusted_color(col: str):
         if page.theme_mode == ft.ThemeMode.LIGHT:
@@ -148,13 +169,13 @@ def main_window(page: ft.Page):
     def toggle_list_expansion(e=None):
         list_expanded[0] = not list_expanded[0]
         log_container.visible = not list_expanded[0]
-        page.update()
+        _safe_page_update()
 
     def append_log(msg: str, color: str = ft.Colors.ON_SURFACE):
         time_str = datetime.now().strftime("%y%m%d %H:%M:%S")
         final_color = get_adjusted_color(color)
         log_area.controls.append(ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500))
-        page.update()
+        _safe_page_update()
     def handle_log(msg: str):
         append_log(msg)
     def handle_alert(msg: str):
@@ -166,7 +187,7 @@ def main_window(page: ft.Page):
 
     def clear_user_id_field(e):
         user_id_field.value = ""
-        user_id_field.update()
+        _safe_update(user_id_field)
 
     user_id_field = ft.TextField(
         label="PixivユーザーID",
@@ -248,7 +269,7 @@ def main_window(page: ft.Page):
             r_text.value = ""
             history.clear()
 
-        page.update()
+        _safe_page_update()
 
     def set_ui_disabled_single(disabled: bool, is_running: bool = False):
         user_id_field.disabled = disabled
@@ -261,7 +282,7 @@ def main_window(page: ft.Page):
         if not is_running:
             pause_btn.text = "一時停止"
             pause_btn.icon = ft.Icons.PAUSE
-        page.update()
+        _safe_page_update()
 
     def run_backup_thread():
         nonlocal _single_eta_timer
@@ -286,7 +307,7 @@ def main_window(page: ft.Page):
         single_pause_event.clear()
         set_ui_disabled_single(True, is_running=True)
         _set_flow_active("single", True)
-        _single_eta_timer = _EtaTimer(remaining_time_text, page)
+        _single_eta_timer = _EtaTimer(remaining_time_text, page, update_lock=_ui_update_lock)
         _single_eta_timer.start()
 
         try:
@@ -338,7 +359,7 @@ def main_window(page: ft.Page):
     def hide_batch_summary(e=None):
         if batch_summary_card is not None and batch_summary_card.visible:
             batch_summary_card.visible = False
-            page.update()
+            _safe_page_update()
 
     batch_target_type_dropdown = ft.Dropdown(
         label="対象", width=160,
@@ -355,7 +376,7 @@ def main_window(page: ft.Page):
     def clear_search_field(e):
         hide_batch_summary()
         search_field.value = ""
-        search_field.update()
+        _safe_update(search_field)
         load_follow_list_ui(search_val_override="")
 
     search_field = ft.TextField(
@@ -426,7 +447,7 @@ def main_window(page: ft.Page):
             db.set_zipped(uid, new_val)
             btn.icon = ft.Icons.ARCHIVE if new_val else ft.Icons.ARCHIVE_OUTLINED
             btn.icon_color = ft.Colors.BLUE_400 if new_val else ft.Colors.GREY_500
-            page.update()
+            _safe_page_update()
 
         def toggle_favorite(e, uid):
             btn = e.control
@@ -435,7 +456,7 @@ def main_window(page: ft.Page):
             db.set_favorite(uid, new_val)
             btn.icon = ft.Icons.STAR if new_val else ft.Icons.STAR_BORDER
             btn.icon_color = ft.Colors.YELLOW_600 if new_val else ft.Colors.GREY_500
-            page.update()
+            _safe_page_update()
 
         for u in users:
             label = f"{u['name']} (ID:{u['user_id']})"
@@ -452,7 +473,7 @@ def main_window(page: ft.Page):
             def on_label_tap(e, cb_ref=cb):
                 hide_batch_summary()
                 cb_ref.value = not cb_ref.value
-                page.update()
+                _safe_page_update()
                 
             gd_content = ft.Container(
                 content=ft.Text(label),
@@ -548,8 +569,8 @@ def main_window(page: ft.Page):
             follow_list_view.controls.append(row)
 
         # 明示的にListViewとページを更新
-        follow_list_view.update()
-        page.update()
+        _safe_update(follow_list_view)
+        _safe_page_update()
         
     search_field.on_change  = lambda e: (hide_batch_summary(), load_follow_list_ui(search_val_override=e.control.value))
 
@@ -566,7 +587,7 @@ def main_window(page: ft.Page):
         if not is_running:
             batch_pause_btn.text = "一時停止"
             batch_pause_btn.icon = ft.Icons.PAUSE
-        page.update()
+        _safe_page_update()
 
     batch_progress_history = []
     _batch_eta_timer: _EtaTimer | None = None
@@ -584,7 +605,7 @@ def main_window(page: ft.Page):
             batch_remaining_time_text.value = ""
             batch_progress_history.clear()
 
-        page.update()
+        _safe_page_update()
 
     batch_summary_text = ft.Row(spacing=10, wrap=True)
     batch_summary_card = ft.Container(
@@ -629,7 +650,7 @@ def main_window(page: ft.Page):
         batch_pause_event.clear()
         set_ui_disabled_batch(True, is_running=True)
         _set_flow_active("batch", True)
-        _batch_eta_timer = _EtaTimer(batch_remaining_time_text, page)
+        _batch_eta_timer = _EtaTimer(batch_remaining_time_text, page, update_lock=_ui_update_lock)
         _batch_eta_timer.start()
 
         try:
@@ -679,19 +700,19 @@ def main_window(page: ft.Page):
             batch_pause_event.set()
             batch_pause_btn.text = "再開"
             batch_pause_btn.icon = ft.Icons.PLAY_ARROW
-        page.update()
+        _safe_page_update()
 
     batch_pause_btn.on_click = on_batch_pause
     batch_stop_btn.on_click  = lambda _: batch_stop_event.set()
-    select_all_btn.on_click   = lambda _: hide_batch_summary() or [setattr(cb, 'value', True) for cb in follow_checkboxes.values()] or page.update()
-    deselect_all_btn.on_click = lambda _: hide_batch_summary() or [setattr(cb, 'value', False) for cb in follow_checkboxes.values()] or page.update()
+    select_all_btn.on_click   = lambda _: hide_batch_summary() or [setattr(cb, 'value', True) for cb in follow_checkboxes.values()] or _safe_page_update()
+    deselect_all_btn.on_click = lambda _: hide_batch_summary() or [setattr(cb, 'value', False) for cb in follow_checkboxes.values()] or _safe_page_update()
 
     def on_select_favorite(e):
         hide_batch_summary()
         favs = [str(u['user_id']) for u in db.get_favorite_users()]
         for uid, cb in follow_checkboxes.items():
             cb.value = str(uid) in favs
-        page.update()
+        _safe_page_update()
     select_favorite_btn.on_click = on_select_favorite
 
     batch_actions_row = ft.Row([
@@ -732,7 +753,7 @@ def main_window(page: ft.Page):
             single_pause_event.set()
             pause_btn.text = "再開"
             pause_btn.icon = ft.Icons.PLAY_ARROW
-        page.update()
+        _safe_page_update()
     pause_btn.on_click = on_pause_click
     stop_btn.on_click  = lambda _: single_stop_event.set()
 
@@ -808,7 +829,7 @@ def main_window(page: ft.Page):
             cookie_status_text.value = f"[失敗] {ex}"
             cookie_status_text.color = ft.Colors.RED_400
             cookie_status_text.visible = True
-        page.update()
+        _safe_page_update()
 
     def _run_folder_picker():
         """保存先フォルダー選択ダイアログをバックグラウンドスレッドで実行"""
@@ -833,13 +854,13 @@ def main_window(page: ft.Page):
                 append_log("フォルダー選択がキャンセルされました。")
         except Exception as ex:
             append_log(f"フォルダー選択エラー: {ex}", color=ft.Colors.RED_400)
-        page.update()
+        _safe_page_update()
 
     def sync_follow_list():
         sync_status_text.value = "Pixivから同期中..."
         sync_status_text.color = get_adjusted_color(ft.Colors.BLUE_400)
         sync_status_text.visible = True
-        page.update()
+        _safe_page_update()
         try:
             client = PixivClient()
             my_id  = client.get_my_user_id()
@@ -855,7 +876,7 @@ def main_window(page: ft.Page):
             sync_status_text.value = f"[失敗] 同期失敗: {e}"
             sync_status_text.color = ft.Colors.RED_400
             sync_status_text.visible = True
-        page.update()
+        _safe_page_update()
 
     def on_zip_all_change(e):
         db.set_setting("zip_all_after_download", "1" if e.control.value else "0")
@@ -954,7 +975,7 @@ def main_window(page: ft.Page):
             cache_status_text.value = "キャッシュはありませんでした。"
             cache_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
         append_log(f"画像のキャッシュを削除しました ({deleted_count}件)")
-        page.update()
+        _safe_page_update()
 
     clear_cache_btn = ft.ElevatedButton(
         "キャッシュを削除する",
@@ -1086,7 +1107,7 @@ def main_window(page: ft.Page):
         import sys
         if not folder_path or not os.path.exists(folder_path):
             page.show_dialog(ft.SnackBar(ft.Text("対象の保存フォルダが見つかりません。"), bgcolor=ft.Colors.RED_700))
-            page.update()
+            _safe_page_update()
             return
         try:
             if sys.platform == "win32":
@@ -1134,7 +1155,7 @@ def main_window(page: ft.Page):
                 ctrl.color = get_adjusted_color(ctrl.color)
 
         update_ext_status()
-        page.update()
+        _safe_page_update()
 
     theme_toggle_btn = ft.IconButton(
         icon=ft.Icons.LIGHT_MODE, tooltip="ライトモードへ切り替え",
@@ -1169,7 +1190,7 @@ def main_window(page: ft.Page):
 
     def close_cookie_banner(e=None):
         cookie_banner.visible = False
-        cookie_banner.update()
+        _safe_update(cookie_banner)
 
     cookie_banner = ft.Container(
         content=ft.Row([
@@ -1235,7 +1256,7 @@ def main_window(page: ft.Page):
                 ext_status_detail.value = "「有効化」ボタンを押すと、拡張機能からの自動起動が使えるようになります。"
                 ext_register_btn.disabled   = False
                 ext_unregister_btn.disabled = True
-        page.update()
+        _safe_page_update()
 
     def on_register_ext(e):
         if registry_helper.register_protocol():
@@ -1335,7 +1356,7 @@ def main_window(page: ft.Page):
         queue_log_area.controls.append(
             ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500)
         )
-        page.update()
+        _safe_page_update()
 
     gui_queue_log_callback[0] = append_queue_log
 
@@ -1393,10 +1414,10 @@ def main_window(page: ft.Page):
         _set_flow_active("bookmark", True)
         bm_stop_event.clear()
         bm_pause_event.clear()
-        bm_eta = _EtaTimer(bm_remaining_time_text, page)
+        bm_eta = _EtaTimer(bm_remaining_time_text, page, update_lock=_ui_update_lock)
         _bm_eta_timer_ref[0] = bm_eta
         bm_eta.start()
-        page.update()
+        _safe_page_update()
 
         try:
             client = PixivClient()
@@ -1430,7 +1451,7 @@ def main_window(page: ft.Page):
             bm_remaining_time_text.value = ""
             bm_progress_history.clear()
             _set_flow_active("bookmark", False)
-            page.update()
+            _safe_page_update()
 
     bm_run_btn.on_click = lambda _: threading.Thread(target=run_bookmark_download_thread, daemon=True).start()
     bm_stop_btn.on_click = lambda _: bm_stop_event.set()
@@ -1444,7 +1465,7 @@ def main_window(page: ft.Page):
             bm_pause_event.set()
             bm_pause_btn.text = "再開"
             bm_pause_btn.icon = ft.Icons.PLAY_ARROW
-        page.update()
+        _safe_page_update()
     bm_pause_btn.on_click = on_bm_pause
 
     check_unfollowed_btn = ft.ElevatedButton("未フォロー作者を確認", icon="person_search")
@@ -1460,7 +1481,7 @@ def main_window(page: ft.Page):
             return
 
         check_unfollowed_btn.disabled = True
-        page.update()
+        _safe_page_update()
 
         try:
             client = PixivClient()
@@ -1474,13 +1495,13 @@ def main_window(page: ft.Page):
             logger.exception(f"未フォロー作者の抽出に失敗しました: {e}")
             handle_alert(f"抽出エラー: {e}")
             check_unfollowed_btn.disabled = False
-            page.update()
+            _safe_page_update()
             return
 
         if not authors:
             handle_alert("未フォローの作者は見つかりませんでした。")
             check_unfollowed_btn.disabled = False
-            page.update()
+            _safe_page_update()
             return
 
         # ダイアログを最初に開く（中身は空）
@@ -1502,7 +1523,7 @@ def main_window(page: ft.Page):
 
         page.show_dialog(dialog)
         check_unfollowed_btn.disabled = False
-        page.update()
+        _safe_page_update()
 
         # 作者リストを1件ずつ追加するスレッド（page.run_threadで管理）
         def load_authors():
@@ -1530,7 +1551,7 @@ def main_window(page: ft.Page):
                 def make_on_follow(au, fb, st):
                     def on_follow(e):
                         fb.disabled = True
-                        page.update()
+                        _safe_page_update()
                         try:
                             client.follow_user(au['user_id'])
                             db.conn.execute(
@@ -1549,7 +1570,7 @@ def main_window(page: ft.Page):
                             st.color = ft.Colors.RED_400
                             fb.disabled = False
                             append_log(f"フォロー失敗: {ex}")
-                        page.update()
+                        _safe_page_update()
                     return on_follow
 
                 follow_btn.on_click = make_on_follow(_author, follow_btn, status_text)
@@ -1577,10 +1598,10 @@ def main_window(page: ft.Page):
                 # 5件ごとに画面更新
                 if i % 5 == 0:
                     loading_text.value = f"{i + 1} / {len(authors)} 件を読み込み中..."
-                    page.update()
+                    _safe_page_update()
 
             loading_text.value = f"読み込み完了: {len(authors)} 人"
-            page.update()
+            _safe_page_update()
 
             # サムネイル高速並行読み込み (8並列)
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1611,8 +1632,8 @@ def main_window(page: ft.Page):
                         updated_count += 1
                         # 4件ごと、あるいは最後の1件で画面更新してレスポンス向上
                         if updated_count % 4 == 0:
-                            page.update()
-                page.update()
+                            _safe_page_update()
+                _safe_page_update()
 
         page.run_thread(load_authors)
 
@@ -1680,7 +1701,7 @@ def main_window(page: ft.Page):
                     border_radius=6
                 )
                 failed_list_view.controls.append(row_card)
-        page.update()
+        _safe_page_update()
 
     def on_retry_all_failed(e):
         jobs = db.get_failed_jobs()
@@ -1748,7 +1769,7 @@ def main_window(page: ft.Page):
         # スレッド側の初回 append がまだ幅0のまま計算された GridView に対して
         # 行われ、以後の更新でも高さ0のまま描画されないことがある(Flet 0.85.3)。
         backup_history_grid.controls.clear()
-        backup_history_grid.update()
+        _safe_update(backup_history_grid)
 
         def _load_history_thread():
             base_img_dir = db.get_setting("save_path", "Images")
@@ -1914,7 +1935,7 @@ def main_window(page: ft.Page):
                         # Stack の奥にある対象コントロール自身を直接 update する
                         # （ジェスチャ元コントロールを update しても子の変更が
                         # 確実に反映されない場合があるため）
-                        target_name_container.update()
+                        _safe_update(target_name_container)
                     return _hover
 
                 # ヒットテストを確実にするため、Stack 全体を GestureDetector で
@@ -1952,10 +1973,10 @@ def main_window(page: ft.Page):
                 # 別スレッドからのUI更新をこのGridViewに限定してレースを避ける）
                 if len(cards) % 10 == 0:
                     backup_history_grid.controls = list(cards)
-                    backup_history_grid.update()
+                    _safe_update(backup_history_grid)
 
             backup_history_grid.controls = cards
-            backup_history_grid.update()
+            _safe_update(backup_history_grid)
 
             if cards:
                 append_log(f"直近のバックアップ: {len(cards)}件のタイルを表示しました。", color=ft.Colors.GREEN_400)
@@ -2016,7 +2037,7 @@ def main_window(page: ft.Page):
         # データ投入を開始する。同時に行うと GridView がまだ幅0のまま
         # レイアウトされ、以後のスレッド側 update() でも高さ0のまま
         # 描画されないことがあるため(Flet 0.85.3)、順序を分離する。
-        page.update()
+        _safe_page_update()
 
         if idx == 6:
             load_backup_history_ui()
@@ -2155,7 +2176,7 @@ def main_window(page: ft.Page):
             else:
                 db.set_setting("my_user_id", str(uid))
                 trigger_auto_sync(uid)
-        page.update()
+        _safe_page_update()
 
     # 初期化
     gui_trigger_cookie_check[0] = lambda: threading.Thread(target=check_login_status, daemon=True).start()
