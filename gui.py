@@ -22,12 +22,13 @@ class _EtaTimer:
     core.py のコールバックが届くたびに eta_sec を補正し、
     独立したデーモンスレッドが毎秒 r_text を更新する。"""
 
-    def __init__(self, r_text: "ft.Text", page: "ft.Page", update_lock: "threading.Lock | None" = None):
+    def __init__(self, r_text: "ft.Text", page: "ft.Page", update_lock: "threading.Lock"):
         self._r_text = r_text
         self._page = page
-        # page.update() はスレッドセーフではなく、ダウンロードスレッド側の page.update() と
-        # 同時に呼ぶと "Frozen controls cannot be updated" になり得るため、呼び出し元と
-        # 同じロックを共有して直列化する。
+        # page.update() はスレッドセーフではなく、値の代入中や page.update() 実行中
+        # （コントロールツリー走査中）に別スレッドが同じコントロールへ値を書き込むと
+        # "Frozen controls cannot be updated" になり得るため、呼び出し元と同じロックを
+        # 共有し、値の代入から page.update() までを不可分な区間として直列化する。
         self._update_lock = update_lock
         self._eta_sec: float = -1.0   # -1 = まだ計算できていない
         self._running = False
@@ -57,24 +58,24 @@ class _EtaTimer:
                 if eta >= 0:
                     self._eta_sec = max(0.0, eta - 1)
 
-            if eta < 0:
-                self._r_text.value = "残り時間計算中..."
-            elif eta == 0:
-                self._r_text.value = ""
-            else:
-                mins, secs = divmod(int(eta), 60)
-                hrs, mins = divmod(mins, 60)
-                if hrs > 0:
-                    self._r_text.value = f"残り約{hrs}時間{mins}分{secs}秒"
-                elif mins > 0:
-                    self._r_text.value = f"残り約{mins}分{secs}秒"
-                else:
-                    self._r_text.value = f"残り約{secs}秒"
+            # 値の代入と page.update() は不可分（他スレッドの page.update() が走査中に
+            # ここで値を書き換えると "Frozen controls cannot be updated" になり得るため）。
+            # ロック外で value を書き換えないこと。
             try:
-                if self._update_lock is not None:
-                    with self._update_lock:
-                        self._page.update()
-                else:
+                with self._update_lock:
+                    if eta < 0:
+                        self._r_text.value = "残り時間計算中..."
+                    elif eta == 0:
+                        self._r_text.value = ""
+                    else:
+                        mins, secs = divmod(int(eta), 60)
+                        hrs, mins = divmod(mins, 60)
+                        if hrs > 0:
+                            self._r_text.value = f"残り約{hrs}時間{mins}分{secs}秒"
+                        elif mins > 0:
+                            self._r_text.value = f"残り約{mins}分{secs}秒"
+                        else:
+                            self._r_text.value = f"残り約{secs}秒"
                     self._page.update()
             except Exception:
                 pass
@@ -258,31 +259,35 @@ def main_window(page: ft.Page):
         if eta_timer_ref is None:
             eta_timer_ref = [_single_eta_timer]
 
-        p_bar.value = current / total if total > 0 else 0
-        p_text.value = f"{current} / {total}"
-
         eta = _calc_eta(history, current, total, elapsed_sec)
         if eta >= 0 and eta_timer_ref[0] is not None:
             eta_timer_ref[0].update_eta(eta)
 
-        if current == total:
-            r_text.value = ""
-            history.clear()
+        # 値の代入から page.update() までを _EtaTimer と同じロックで不可分に行う
+        # （他スレッドの page.update() 走査中に値を書き換えると frozen エラーになるため）
+        with _ui_update_lock:
+            p_bar.value = current / total if total > 0 else 0
+            p_text.value = f"{current} / {total}"
 
-        _safe_page_update()
+            if current == total:
+                r_text.value = ""
+                history.clear()
+
+            page.update()
 
     def set_ui_disabled_single(disabled: bool, is_running: bool = False):
-        user_id_field.disabled = disabled
-        mode_dropdown.disabled = disabled
-        target_type_dropdown.disabled = disabled
-        run_btn.disabled       = disabled
-        export_btn.disabled    = disabled
-        pause_btn.disabled     = not is_running
-        stop_btn.disabled      = not is_running
-        if not is_running:
-            pause_btn.text = "一時停止"
-            pause_btn.icon = ft.Icons.PAUSE
-        _safe_page_update()
+        with _ui_update_lock:
+            user_id_field.disabled = disabled
+            mode_dropdown.disabled = disabled
+            target_type_dropdown.disabled = disabled
+            run_btn.disabled       = disabled
+            export_btn.disabled    = disabled
+            pause_btn.disabled     = not is_running
+            stop_btn.disabled      = not is_running
+            if not is_running:
+                pause_btn.text = "一時停止"
+                pause_btn.icon = ft.Icons.PAUSE
+            page.update()
 
     def run_backup_thread():
         nonlocal _single_eta_timer
@@ -300,9 +305,11 @@ def main_window(page: ft.Page):
         is_full = (mode_dropdown.value == "full")
         target_type = target_type_dropdown.value
         append_log("--- 個別ダウンロードを開始します ---", color=ft.Colors.BLUE_300)
-        progress_bar.value = 0
-        progress_bar.visible = True
-        progress_text.visible = True
+        with _ui_update_lock:
+            progress_bar.value = 0
+            progress_bar.visible = True
+            progress_text.visible = True
+            page.update()
         single_stop_event.clear()
         single_pause_event.clear()
         set_ui_disabled_single(True, is_running=True)
@@ -327,9 +334,11 @@ def main_window(page: ft.Page):
             if _single_eta_timer is not None:
                 _single_eta_timer.stop()
                 _single_eta_timer = None
-            progress_bar.visible = False
-            progress_text.visible = False
-            remaining_time_text.value = ""
+            with _ui_update_lock:
+                progress_bar.visible = False
+                progress_text.visible = False
+                remaining_time_text.value = ""
+                page.update()
             progress_history.clear()
             _set_flow_active("single", False)
             set_ui_disabled_single(False, is_running=False)
@@ -575,37 +584,39 @@ def main_window(page: ft.Page):
     search_field.on_change  = lambda e: (hide_batch_summary(), load_follow_list_ui(search_val_override=e.control.value))
 
     def set_ui_disabled_batch(disabled: bool, is_running: bool = False):
-        batch_run_btn.disabled    = disabled
-        batch_target_type_dropdown.disabled = disabled
-        select_all_btn.disabled   = disabled
-        deselect_all_btn.disabled = disabled
-        select_favorite_btn.disabled = disabled
-        for cb in follow_checkboxes.values():
-            cb.disabled = disabled
-        batch_pause_btn.disabled = not is_running
-        batch_stop_btn.disabled  = not is_running
-        if not is_running:
-            batch_pause_btn.text = "一時停止"
-            batch_pause_btn.icon = ft.Icons.PAUSE
-        _safe_page_update()
+        with _ui_update_lock:
+            batch_run_btn.disabled    = disabled
+            batch_target_type_dropdown.disabled = disabled
+            select_all_btn.disabled   = disabled
+            deselect_all_btn.disabled = disabled
+            select_favorite_btn.disabled = disabled
+            for cb in follow_checkboxes.values():
+                cb.disabled = disabled
+            batch_pause_btn.disabled = not is_running
+            batch_stop_btn.disabled  = not is_running
+            if not is_running:
+                batch_pause_btn.text = "一時停止"
+                batch_pause_btn.icon = ft.Icons.PAUSE
+            page.update()
 
     batch_progress_history = []
     _batch_eta_timer: _EtaTimer | None = None
 
     def handle_batch_progress(idx: int, total: int, user_id: str, elapsed_sec: float = 0):
         nonlocal _batch_eta_timer
-        batch_progress_bar.value  = idx / total if total > 0 else 0
-        batch_progress_text.value = f"作者 {idx} / {total}"
-
         eta = _calc_eta(batch_progress_history, idx, total, elapsed_sec)
         if eta >= 0 and _batch_eta_timer is not None:
             _batch_eta_timer.update_eta(eta)
 
-        if idx == total:
-            batch_remaining_time_text.value = ""
-            batch_progress_history.clear()
+        with _ui_update_lock:
+            batch_progress_bar.value  = idx / total if total > 0 else 0
+            batch_progress_text.value = f"作者 {idx} / {total}"
 
-        _safe_page_update()
+            if idx == total:
+                batch_remaining_time_text.value = ""
+                batch_progress_history.clear()
+
+            page.update()
 
     batch_summary_text = ft.Row(spacing=10, wrap=True)
     batch_summary_card = ft.Container(
@@ -643,9 +654,11 @@ def main_window(page: ft.Page):
             return
 
         append_log(f"--- {len(selected_ids)}人の一括ダウンロードを開始します ---", color=ft.Colors.BLUE_300)
-        batch_progress_bar.value   = 0
-        batch_progress_bar.visible = True
-        batch_progress_text.visible = True
+        with _ui_update_lock:
+            batch_progress_bar.value   = 0
+            batch_progress_bar.visible = True
+            batch_progress_text.visible = True
+            page.update()
         batch_stop_event.clear()
         batch_pause_event.clear()
         set_ui_disabled_batch(True, is_running=True)
@@ -656,21 +669,25 @@ def main_window(page: ft.Page):
         try:
             client = PixivClient()
             target_type = batch_target_type_dropdown.value
-            batch_summary_card.visible = False
+            with _ui_update_lock:
+                batch_summary_card.visible = False
+                page.update()
             stats = run_batch_backup(
                 user_ids=selected_ids, client=client, db=db, is_full=False, target_type=target_type,
                 log_callback=handle_log, progress_callback=None, alert_callback=handle_alert,
                 stop_event=batch_stop_event, pause_event=batch_pause_event, batch_progress_callback=handle_batch_progress
             )
             if stats and isinstance(stats, dict):
-                batch_summary_text.controls = [
-                    ft.Container(content=ft.Text(f"〇 新規: {stats.get('new_count', 0)}件", color=ft.Colors.GREEN, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.GREEN), padding=4, border_radius=4),
-                    ft.Container(content=ft.Text(f"△ 更新: {stats.get('updated_count', 0)}件", color=ft.Colors.BLUE, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.BLUE), padding=4, border_radius=4),
-                    ft.Container(content=ft.Text(f"× 削除検知: {stats.get('deleted_count', 0)}件", color=ft.Colors.RED if stats.get('deleted_count', 0) > 0 else ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.RED) if stats.get('deleted_count', 0) > 0 else ft.Colors.SURFACE_CONTAINER_HIGHEST, padding=4, border_radius=4),
-                    ft.Container(content=ft.Text(f"↺ 復帰: {stats.get('restored_count', 0)}件", color=ft.Colors.TEAL, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.TEAL), padding=4, border_radius=4),
-                    ft.Text(f"スキップ: {stats.get('skipped_count', 0)}件 | エラー: {stats.get('failed_count', 0)}件", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
-                ]
-                batch_summary_card.visible = True
+                with _ui_update_lock:
+                    batch_summary_text.controls = [
+                        ft.Container(content=ft.Text(f"〇 新規: {stats.get('new_count', 0)}件", color=ft.Colors.GREEN, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.GREEN), padding=4, border_radius=4),
+                        ft.Container(content=ft.Text(f"△ 更新: {stats.get('updated_count', 0)}件", color=ft.Colors.BLUE, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.BLUE), padding=4, border_radius=4),
+                        ft.Container(content=ft.Text(f"× 削除検知: {stats.get('deleted_count', 0)}件", color=ft.Colors.RED if stats.get('deleted_count', 0) > 0 else ft.Colors.ON_SURFACE_VARIANT, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.RED) if stats.get('deleted_count', 0) > 0 else ft.Colors.SURFACE_CONTAINER_HIGHEST, padding=4, border_radius=4),
+                        ft.Container(content=ft.Text(f"↺ 復帰: {stats.get('restored_count', 0)}件", color=ft.Colors.TEAL, weight=ft.FontWeight.BOLD), bgcolor=ft.Colors.with_opacity(0.15, ft.Colors.TEAL), padding=4, border_radius=4),
+                        ft.Text(f"スキップ: {stats.get('skipped_count', 0)}件 | エラー: {stats.get('failed_count', 0)}件", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
+                    ]
+                    batch_summary_card.visible = True
+                    page.update()
             append_log("--- 一括ダウンロードが完了しました ---", color=ft.Colors.GREEN_400)
         except Exception as e:
             if batch_stop_event.is_set():
@@ -681,9 +698,11 @@ def main_window(page: ft.Page):
             if _batch_eta_timer is not None:
                 _batch_eta_timer.stop()
                 _batch_eta_timer = None
-            batch_progress_bar.visible  = False
-            batch_progress_text.visible = False
-            batch_remaining_time_text.value = ""
+            with _ui_update_lock:
+                batch_progress_bar.visible  = False
+                batch_progress_text.visible = False
+                batch_remaining_time_text.value = ""
+                page.update()
             batch_progress_history.clear()
             _set_flow_active("batch", False)
             set_ui_disabled_batch(False, is_running=False)
@@ -692,27 +711,44 @@ def main_window(page: ft.Page):
     batch_run_btn.on_click = lambda _: threading.Thread(target=run_batch_thread, daemon=True).start()
 
     def on_batch_pause(e):
-        if batch_pause_event.is_set():
-            batch_pause_event.clear()
-            batch_pause_btn.text = "一時停止"
-            batch_pause_btn.icon = ft.Icons.PAUSE
-        else:
-            batch_pause_event.set()
-            batch_pause_btn.text = "再開"
-            batch_pause_btn.icon = ft.Icons.PLAY_ARROW
-        _safe_page_update()
+        with _ui_update_lock:
+            if batch_pause_event.is_set():
+                batch_pause_event.clear()
+                batch_pause_btn.text = "一時停止"
+                batch_pause_btn.icon = ft.Icons.PAUSE
+            else:
+                batch_pause_event.set()
+                batch_pause_btn.text = "再開"
+                batch_pause_btn.icon = ft.Icons.PLAY_ARROW
+            page.update()
 
     batch_pause_btn.on_click = on_batch_pause
     batch_stop_btn.on_click  = lambda _: batch_stop_event.set()
-    select_all_btn.on_click   = lambda _: hide_batch_summary() or [setattr(cb, 'value', True) for cb in follow_checkboxes.values()] or _safe_page_update()
-    deselect_all_btn.on_click = lambda _: hide_batch_summary() or [setattr(cb, 'value', False) for cb in follow_checkboxes.values()] or _safe_page_update()
+
+    def on_select_all(e):
+        hide_batch_summary()
+        with _ui_update_lock:
+            for cb in follow_checkboxes.values():
+                cb.value = True
+            page.update()
+
+    def on_deselect_all(e):
+        hide_batch_summary()
+        with _ui_update_lock:
+            for cb in follow_checkboxes.values():
+                cb.value = False
+            page.update()
+
+    select_all_btn.on_click   = on_select_all
+    deselect_all_btn.on_click = on_deselect_all
 
     def on_select_favorite(e):
         hide_batch_summary()
         favs = [str(u['user_id']) for u in db.get_favorite_users()]
-        for uid, cb in follow_checkboxes.items():
-            cb.value = str(uid) in favs
-        _safe_page_update()
+        with _ui_update_lock:
+            for uid, cb in follow_checkboxes.items():
+                cb.value = str(uid) in favs
+            page.update()
     select_favorite_btn.on_click = on_select_favorite
 
     batch_actions_row = ft.Row([
@@ -1405,19 +1441,20 @@ def main_window(page: ft.Page):
             handle_alert("ログインチェックを完了してください。")
             return
 
-        bm_run_btn.disabled = True
-        bm_pause_btn.disabled = False
-        bm_stop_btn.disabled = False
-        bm_progress_bar.value = 0
-        bm_progress_bar.visible = True
-        bm_progress_text.visible = True
+        with _ui_update_lock:
+            bm_run_btn.disabled = True
+            bm_pause_btn.disabled = False
+            bm_stop_btn.disabled = False
+            bm_progress_bar.value = 0
+            bm_progress_bar.visible = True
+            bm_progress_text.visible = True
+            page.update()
         _set_flow_active("bookmark", True)
         bm_stop_event.clear()
         bm_pause_event.clear()
         bm_eta = _EtaTimer(bm_remaining_time_text, page, update_lock=_ui_update_lock)
         _bm_eta_timer_ref[0] = bm_eta
         bm_eta.start()
-        _safe_page_update()
 
         try:
             client = PixivClient()
@@ -1443,29 +1480,31 @@ def main_window(page: ft.Page):
             if _bm_eta_timer_ref[0] is not None:
                 _bm_eta_timer_ref[0].stop()
                 _bm_eta_timer_ref[0] = None
-            bm_run_btn.disabled = False
-            bm_pause_btn.disabled = True
-            bm_stop_btn.disabled = True
-            bm_progress_bar.visible = False
-            bm_progress_text.visible = False
-            bm_remaining_time_text.value = ""
+            with _ui_update_lock:
+                bm_run_btn.disabled = False
+                bm_pause_btn.disabled = True
+                bm_stop_btn.disabled = True
+                bm_progress_bar.visible = False
+                bm_progress_text.visible = False
+                bm_remaining_time_text.value = ""
+                page.update()
             bm_progress_history.clear()
             _set_flow_active("bookmark", False)
-            _safe_page_update()
 
     bm_run_btn.on_click = lambda _: threading.Thread(target=run_bookmark_download_thread, daemon=True).start()
     bm_stop_btn.on_click = lambda _: bm_stop_event.set()
 
     def on_bm_pause(e):
-        if bm_pause_event.is_set():
-            bm_pause_event.clear()
-            bm_pause_btn.text = "一時停止"
-            bm_pause_btn.icon = ft.Icons.PAUSE
-        else:
-            bm_pause_event.set()
-            bm_pause_btn.text = "再開"
-            bm_pause_btn.icon = ft.Icons.PLAY_ARROW
-        _safe_page_update()
+        with _ui_update_lock:
+            if bm_pause_event.is_set():
+                bm_pause_event.clear()
+                bm_pause_btn.text = "一時停止"
+                bm_pause_btn.icon = ft.Icons.PAUSE
+            else:
+                bm_pause_event.set()
+                bm_pause_btn.text = "再開"
+                bm_pause_btn.icon = ft.Icons.PLAY_ARROW
+            page.update()
     bm_pause_btn.on_click = on_bm_pause
 
     check_unfollowed_btn = ft.ElevatedButton("未フォロー作者を確認", icon="person_search")
