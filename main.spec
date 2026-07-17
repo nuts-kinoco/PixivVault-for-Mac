@@ -82,6 +82,9 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleShortVersionString': '3.0',
             'NSHighResolutionCapable': True,
+            # 実UIは~/.flet/client配下のFlet.app(main.pyでPixivVaultにブランディング)が担うため、
+            # 本体側はDock/Cmd+Tabに表示させずDock二重表示を防ぐ
+            'LSUIElement': True,
             'CFBundleURLTypes': [
                 {
                     'CFBundleURLName': 'PixivVault Protocol',
