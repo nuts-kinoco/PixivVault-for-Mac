@@ -1245,7 +1245,7 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
             advanced_settings,
 
             ft.Row([
-                ft.Text("v3.0 build260718", size=11, color=ft.Colors.GREY_600)
+                ft.Text("v1.0.0 build 260719", size=11, color=ft.Colors.GREY_600)
             ], alignment=ft.MainAxisAlignment.CENTER),
             ft.Row([
                 ft.TextButton("閉じる", on_click=on_settings_close)

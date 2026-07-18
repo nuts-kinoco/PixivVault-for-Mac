@@ -80,7 +80,7 @@ if sys.platform == 'darwin':
         icon='assets/icon.icns',
         bundle_identifier='com.pixivvault.app',
         info_plist={
-            'CFBundleShortVersionString': '3.0',
+            'CFBundleShortVersionString': '1.0.0',
             'NSHighResolutionCapable': True,
             # 実UIは~/.flet/client配下のFlet.app(main.pyでPixivVaultにブランディング)が担うため、
             # 本体側はDock/Cmd+Tabに表示させずDock二重表示を防ぐ
