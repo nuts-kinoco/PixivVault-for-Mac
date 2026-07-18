@@ -51,13 +51,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         .catch(err => sendResponse({ success: false, error: err.toString(), kind: classifyFetchError(err) }));
         return true;
     } else if (request.action === "syncCookies") {
-        syncCookiesToServer().then(res => sendResponse({ success: true, ...res })).catch(err => sendResponse({ success: false, error: err.toString() }));
+        syncCookiesToServer(false).then(res => sendResponse({ success: true, ...res })).catch(err => sendResponse({ success: false, error: err.toString() }));
         return true;
     }
 });
 
+let lastSyncTimestamp = 0;
+const MIN_SYNC_INTERVAL_MS = 60 * 1000; // 最短1分間隔でのみサーバーへのPOSTを許可
+
 // PixivのCookieを取得しローカルサーバーの /api/cookie/sync に送信する
-async function syncCookiesToServer() {
+async function syncCookiesToServer(force = false) {
+    const now = Date.now();
+    if (!force && (now - lastSyncTimestamp < MIN_SYNC_INTERVAL_MS)) {
+        return { synced: false, reason: "Throttled" };
+    }
+    lastSyncTimestamp = now;
+
     try {
         const cookies = await chrome.cookies.getAll({ domain: "pixiv.net" });
         if (!cookies || cookies.length === 0) {
@@ -84,16 +93,16 @@ async function syncCookiesToServer() {
 // アラーム設定および起動時・インストール時にCookie自動同期を実行
 chrome.runtime.onInstalled.addListener(() => {
     chrome.alarms.create("sync_cookies", { periodInMinutes: 30 });
-    syncCookiesToServer();
+    syncCookiesToServer(true);
 });
 
 chrome.runtime.onStartup.addListener(() => {
-    syncCookiesToServer();
+    syncCookiesToServer(true);
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "sync_cookies") {
-        syncCookiesToServer();
+        syncCookiesToServer(true);
     }
 });
 

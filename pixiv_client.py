@@ -72,7 +72,8 @@ class PixivClient:
             cj = http.cookiejar.MozillaCookieJar(cookie_file)
             cj.load(ignore_discard=True, ignore_expires=True)
             self.session.cookies.update(cj)
-            
+            self.cj = cj  # Cookie自動延長保存のためインスタンス変数に保持する
+
             # PixivのCookieが入っているか軽く確認します
             has_pixiv = any('pixiv.net' in cookie.domain for cookie in cj)
             if not has_pixiv:
@@ -323,7 +324,6 @@ class PixivClient:
                 cursor.execute("SELECT host_key, name, value, encrypted_value, path, expires_utc, is_secure FROM cookies WHERE host_key LIKE '%pixiv%'")
                 rows = cursor.fetchall()
                 conn.close()
-                os.remove(temp_db)
 
                 for host, name, val, enc_val, path, expires_utc, is_secure in rows:
                     value = val
@@ -350,6 +350,13 @@ class PixivClient:
             except Exception as ex:
                 logger.debug(f"{browser_name} ({prof}) 解読エラー: {ex}")
                 continue
+            finally:
+                # 例外発生時も確実に一時ファイルを削除する
+                try:
+                    if os.path.exists(temp_db):
+                        os.remove(temp_db)
+                except Exception:
+                    pass
 
         return found_cookies
 
@@ -923,6 +930,33 @@ class PixivClient:
                 urls.append(original_url)
                 
         return urls
+
+    def get_ugoira_meta(self, work_id: str) -> dict:
+        """指定した作品IDのうごイラメタデータ(フレーム遅延情報・ZIP URL)を取得します。"""
+        url = f"https://www.pixiv.net/ajax/illust/{work_id}/ugoira_meta"
+        data = self._request_with_retry(url)
+        return data.get('body', {})
+
+    def download_ugoira_zip_data(self, url: str) -> bytes:
+        """うごイラのZIPデータをメモリへダウンロードして返します。"""
+        interval, max_retries, retry_wait = self.get_rate_settings()
+        for attempt in range(max_retries):
+            try:
+                sleep_time = random.uniform(interval * 0.8, interval * 1.2) if interval > 0 else 0
+                if sleep_time > 0:
+                    logger.debug(f"うごイラZIPダウンロード前に {sleep_time:.2f} 秒待機します。")
+                    time.sleep(sleep_time)
+
+                headers = {'Referer': 'https://www.pixiv.net/'}
+                response = self.session.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                return response.content
+            except (requests.RequestException, ValueError, Exception) as e:
+                logger.warning(f"うごイラZIPのダウンロードに失敗しました（{attempt + 1}/{max_retries}回目）: {e}")
+                if attempt == max_retries - 1:
+                    logger.error("最大リトライ回数に達しました。")
+                    raise
+                time.sleep((2 ** attempt) + random.uniform(0, 1))
 
     def download_image(self, url: str, save_path: str):
         """画像のURLからデータをダウンロードし、ローカルに保存します。"""

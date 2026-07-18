@@ -278,8 +278,14 @@ if (window.location.pathname.includes('/following') || window.location.pathname.
     injectUserButtons();
 }
 
-// ページロード時およびフォーカス時に自動Cookie同期をリクエスト
+// ページロード時およびフォーカス時に自動Cookie同期をリクエスト (最短3分間隔で制限)
+let lastCookieSyncRequestTime = 0;
 function requestCookieSync() {
+    const now = Date.now();
+    if (now - lastCookieSyncRequestTime < 180 * 1000) {
+        return;
+    }
+    lastCookieSyncRequestTime = now;
     if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
         chrome.runtime.sendMessage({ action: "syncCookies" }).catch(() => {});
     }

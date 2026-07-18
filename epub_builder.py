@@ -118,8 +118,15 @@ def create_epub(output_path: str, title: str, author: str, content_html: str, co
         # 画像の書き込み
         if cover_image_path and os.path.exists(cover_image_path):
             ext = os.path.splitext(cover_image_path)[1].lower()
-            zf.write(cover_image_path, f'OEBPS/Images/cover{ext}', compress_type=zipfile.ZIP_DEFLATED)
+            try:
+                zf.write(cover_image_path, f'OEBPS/Images/cover{ext}', compress_type=zipfile.ZIP_DEFLATED)
+            except FileNotFoundError:
+                pass  # 書き込み直前にファイルが消えた場合はスキップ
             
         for img in embedded_images:
             if os.path.exists(img['path']):
-                zf.write(img['path'], f'OEBPS/Images/{img["id"]}{img["ext"].lower()}', compress_type=zipfile.ZIP_DEFLATED)
+                try:
+                    zf.write(img['path'], f'OEBPS/Images/{img["id"]}{img["ext"].lower()}', compress_type=zipfile.ZIP_DEFLATED)
+                except FileNotFoundError:
+                    pass  # 書き込み直前にファイルが消えた場合はスキップ
+

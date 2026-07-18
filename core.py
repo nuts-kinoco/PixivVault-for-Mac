@@ -10,6 +10,17 @@ from datetime import datetime
 from database import Database
 from pixiv_client import PixivClient
 import epub_builder
+import io
+from PIL import Image
+
+class StopRequested(Exception):
+    """ユーザーが停止操作を行ったことを示す例外。check_state() から送出される。
+
+    save_ugoira() の MP4変換処理はOpenCV/imageio呼び出し失敗をラップするため広い
+    except Exception を使っているが、これがユーザーの停止要求まで誤って握りつぶし
+    GIF形式へフォールバックしてしまわないよう、この例外だけは明示的に再送出する。
+    """
+    pass
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', '_', name)
@@ -206,8 +217,10 @@ def verify_work_integrity(target_path: str, is_zip: bool = False, expected_page_
                 return False, f"ファイルが見つかりません ({os.path.basename(file_p)})"
             if os.path.getsize(file_p) == 0:
                 return False, f"0バイトファイル検出 ({os.path.basename(file_p)})"
-            if os.path.splitext(file_p)[1].lower() in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+            if os.path.splitext(file_p)[1].lower() in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4"]:
                 image_files.append(file_p)
+        if any(os.path.splitext(fp)[1].lower() in [".gif", ".mp4"] for fp in file_paths):
+            return True, None
         if expected_page_count and expected_page_count > 0 and len(image_files) < expected_page_count:
             return False, f"ページ不足 (期待値:{expected_page_count} 実際の枚数:{len(image_files)})"
         return True, None
@@ -235,14 +248,16 @@ def verify_work_integrity(target_path: str, is_zip: bool = False, expected_page_
         for root, _, files in os.walk(target_path):
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
-                if ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".txt", ".epub"]:
+                if ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".txt", ".epub", ".mp4"]:
                     file_p = os.path.join(root, file)
                     if os.path.getsize(file_p) == 0:
                         return False, f"0バイトファイル検出 ({file})"
-                    if ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]:
+                    if ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4"]:
                         image_files.append(file_p)
-        
+
         if expected_page_count and expected_page_count > 0:
+            if any(fp.lower().endswith(".gif") or fp.lower().endswith(".mp4") for fp in image_files):
+                return True, None
             if len(image_files) < expected_page_count:
                 return False, f"ページ不足 (期待値:{expected_page_count} 実際の枚数:{len(image_files)})"
         return True, None
@@ -250,6 +265,148 @@ def verify_work_integrity(target_path: str, is_zip: bool = False, expected_page_
     if os.path.getsize(target_path) == 0:
         return False, "0バイトファイル検出"
     return True, None
+
+def save_ugoira(
+    client: PixivClient,
+    work_id: str,
+    title: str,
+    user_id: str,
+    user_name: str,
+    work_img_dir: str,
+    use_work_folder: bool,
+    safe_title: str,
+    check_state_cb,
+    log_cb,
+    db: Database,
+    ugoira_save_format: str
+) -> tuple[bool, str, list]:
+    """うごイラ作品のダウンロードおよび指定されたフォーマットへの保存を行います。
+
+    戻り値: (is_ok: bool, error_reason: str or None, saved_file_paths: list)
+    """
+    check_state_cb()
+    meta = client.get_ugoira_meta(work_id)
+    zip_url = meta.get("originalSrc")
+    frames = meta.get("frames", [])
+    if not zip_url or not frames:
+        return False, "うごイラのメタデータ(フレーム遅延情報等)を取得できませんでした", []
+
+    check_state_cb()
+    log_cb(f"うごイラZIPをダウンロード中... (コマ数: {len(frames)})", "DEBUG")
+    try:
+        zip_data = client.download_ugoira_zip_data(zip_url)
+    except Exception as e:
+        return False, f"うごイラZIPダウンロード失敗 ({e})", []
+
+    check_state_cb()
+    zip_buffer = io.BytesIO(zip_data)
+    durations = [int(f.get("delay", 100)) for f in frames]
+
+    saved_file_paths = []
+
+    try:
+        with zipfile.ZipFile(zip_buffer) as zf:
+            if ugoira_save_format == "folder":
+                if use_work_folder:
+                    ugoira_dir = work_img_dir
+                else:
+                    ugoira_dir = os.path.join(work_img_dir, f"{safe_title[:30]}({work_id})")
+                os.makedirs(ugoira_dir, exist_ok=True)
+
+                for frame in frames:
+                    check_state_cb()
+                    file_name = frame["file"]
+                    extracted_path = os.path.join(ugoira_dir, file_name)
+                    with zf.open(file_name) as src, open(extracted_path, "wb") as dst:
+                        dst.write(src.read())
+                    saved_file_paths.append(extracted_path)
+
+                json_path = os.path.join(ugoira_dir, "ugoira_meta.json")
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump({"frames": frames}, f, indent=4, ensure_ascii=False)
+                saved_file_paths.append(json_path)
+
+                log_cb(f"うごイラを展開フォルダに保存しました: {os.path.basename(ugoira_dir)}", "DEBUG")
+                return True, None, saved_file_paths
+
+            pil_images = []
+            for frame in frames:
+                check_state_cb()
+                file_name = frame["file"]
+                with zf.open(file_name) as img_file:
+                    img = Image.open(img_file).convert("RGBA")
+                    pil_images.append(img)
+
+            if not pil_images:
+                return False, "うごイラZIP内に画像が存在しませんでした", []
+
+            if ugoira_save_format == "mp4":
+                mp4_filename = f"{safe_title}.mp4" if use_work_folder else f"{safe_title}_{work_id}.mp4"
+                mp4_path = os.path.join(work_img_dir, mp4_filename)
+
+                mp4_success = False
+                try:
+                    import cv2
+                    import numpy as np
+                    avg_delay = sum(durations) / max(len(durations), 1)
+                    fps = max(1.0, min(60.0, 1000.0 / max(avg_delay, 10)))
+
+                    height, width = pil_images[0].height, pil_images[0].width
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(mp4_path, fourcc, fps, (width, height))
+                    if out.isOpened():
+                        for img in pil_images:
+                            check_state_cb()
+                            bgr_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2BGR)
+                            out.write(bgr_img)
+                        out.release()
+                        mp4_success = os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0
+                except StopRequested:
+                    raise
+                except Exception as e_mp4:
+                    log_cb(f"OpenCVによるMP4変換に失敗しました: {e_mp4}", "DEBUG")
+
+                if not mp4_success:
+                    try:
+                        import imageio
+                        import numpy as np
+                        avg_delay = sum(durations) / max(len(durations), 1)
+                        fps = max(1.0, min(60.0, 1000.0 / max(avg_delay, 10)))
+                        with imageio.get_writer(mp4_path, fps=fps, codec='libx264') as writer:
+                            for img in pil_images:
+                                check_state_cb()
+                                writer.append_data(np.array(img.convert("RGB")))
+                        mp4_success = os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0
+                    except StopRequested:
+                        raise
+                    except Exception as e_io:
+                        log_cb(f"imageioによるMP4変換に失敗しました: {e_io}", "DEBUG")
+
+                if mp4_success:
+                    log_cb(f"うごイラのMP4保存に成功しました: {mp4_filename}", "DEBUG")
+                    return True, None, [mp4_path]
+                else:
+                    log_cb("MP4変換用ライブラリがないか失敗したため、GIF形式で自動保存します。", "WARNING")
+
+            gif_filename = f"{safe_title}.gif" if use_work_folder else (f"{safe_title}.gif" if not os.path.exists(os.path.join(work_img_dir, f"{safe_title}.gif")) else f"{safe_title}_{work_id}.gif")
+            gif_path = os.path.join(work_img_dir, gif_filename)
+            first_img = pil_images[0]
+            first_img.save(
+                gif_path,
+                format="GIF",
+                save_all=True,
+                append_images=pil_images[1:],
+                duration=durations,
+                loop=0,
+                disposal=2
+            )
+            log_cb(f"うごイラのGIF保存に成功しました: {gif_filename}", "DEBUG")
+            return True, None, [gif_path]
+
+    except StopRequested:
+        raise
+    except Exception as e:
+        return False, f"うごイラ変換処理中にエラーが発生しました ({e})", []
 
 def run_backup(user_id: str, client: PixivClient, db: Database, is_full: bool = False, target_type: str = "both", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None, new_only: bool = False):
     """作者(user_id)単位で排他制御しながらバックアップを実行する。
@@ -292,12 +449,12 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
 
     def check_state():
         if stop_event and stop_event.is_set():
-            raise Exception("処理がユーザーによって中止されました。")
+            raise StopRequested("処理がユーザーによって中止されました。")
         if pause_event and pause_event.is_set():
             log("処理を一時停止しています...", "INFO")
             while pause_event.is_set():
                 if stop_event and stop_event.is_set():
-                    raise Exception("処理がユーザーによって中止されました。")
+                    raise StopRequested("処理がユーザーによって中止されました。")
                 pause_event.wait(timeout=1.0)
             log("処理を再開します。", "INFO")
 
@@ -369,6 +526,7 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
         log("【フェーズC】画像のダウンロードとDBの更新を行います。")
     base_img_dir = db.get_setting("save_path", "Images")
     novel_save_format = db.get_setting("novel_save_format", "epub")
+    ugoira_save_format = db.get_setting("ugoira_save_format", "gif")
     use_work_folder = db.get_setting("use_work_folder", "0") == "1"
     total = len(current_works)
     # 今回のダウンロード対象が0件（または全件が既に最新）の場合でも、
@@ -508,13 +666,14 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
                             f.write(txt_content)
                         log(f"小説のTXT保存に成功しました: {txt_name}", "DEBUG")
                         
-                    db.upsert_work(work_id, user_id, title, page_count, create_date, update_date, content_type='novel')
+                    # 品質チェックを先に実施し、成功時のみ DB を更新する
                     is_valid, reason = verify_work_integrity(epub_path if novel_save_format in ('epub', 'both') else txt_path)
                     if not is_valid:
                         log(f"小説作品の品質チェック異常を検出しました (ID: {work_id}): {reason}", "WARNING")
                         db.add_failed_job(work_id, user_id, title, "novel", reason)
                         stats["failed_count"] += 1
                     else:
+                        db.upsert_work(work_id, user_id, title, page_count, create_date, update_date, content_type='novel')
                         db.remove_failed_job(work_id)
                         if status_type == "new":
                             stats["new_count"] += 1
@@ -525,6 +684,41 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
                         elif status_type == "skipped":
                             stats["skipped_count"] += 1
                     log(f"作品DBを更新しました: {title}", "DEBUG")
+
+
+                elif work.get("type") in (2, "ugoira"):
+                    is_ok, reason, saved_file_paths = save_ugoira(
+                        client, work_id, title, user_id, user_name,
+                        work_img_dir, use_work_folder, safe_title,
+                        check_state, log, db, ugoira_save_format
+                    )
+                    if not is_ok:
+                        log(f"うごイラ作品の保存に失敗しました (ID: {work_id}): {reason}", "WARNING")
+                        db.add_failed_job(work_id, user_id, title, "ugoira", reason)
+                        stats["failed_count"] += 1
+                        continue
+
+                    is_valid, reason = verify_work_integrity(
+                        work_img_dir if ugoira_save_format == "folder" else saved_file_paths[0],
+                        file_paths=saved_file_paths if ugoira_save_format == "folder" else [saved_file_paths[0]]
+                    )
+                    if not is_valid:
+                        log(f"うごイラ作品の品質チェック異常を検出しました (ID: {work_id}): {reason}", "WARNING")
+                        db.add_failed_job(work_id, user_id, title, "ugoira", reason)
+                        stats["failed_count"] += 1
+                    else:
+                        db.upsert_work(work_id, user_id, title, page_count, create_date, update_date, content_type='ugoira')
+                        db.remove_failed_job(work_id)
+                        if status_type == "new":
+                            stats["new_count"] += 1
+                        elif status_type == "updated":
+                            stats["updated_count"] += 1
+                        elif status_type == "restored":
+                            stats["restored_count"] += 1
+                        elif status_type == "skipped":
+                            stats["skipped_count"] += 1
+                        log(f"作品DBを更新しました: {title}", "DEBUG")
+
 
                 else:
                     img_urls = client.get_image_urls(work_id)
@@ -559,14 +753,14 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
                             client.download_image(img_url, save_path)
                             log(f"画像の保存に成功しました: {filename}", "DEBUG")
 
-                    # 全ページの確認・ダウンロードが成功したらDBを更新 (upsert_work内部でcommitされる)
-                    db.upsert_work(work_id, user_id, title, page_count, create_date, update_date, content_type='illust')
+                    # 品質チェックを先に実施し、成功時のみ DB を更新する (upsert_work内部でcommitされる)
                     is_valid, reason = verify_work_integrity(work_img_dir, expected_page_count=page_count, file_paths=saved_file_paths)
                     if not is_valid:
                         log(f"イラスト作品の品質チェック異常を検出しました (ID: {work_id}): {reason}", "WARNING")
                         db.add_failed_job(work_id, user_id, title, "illust", reason)
                         stats["failed_count"] += 1
                     else:
+                        db.upsert_work(work_id, user_id, title, page_count, create_date, update_date, content_type='illust')
                         db.remove_failed_job(work_id)
                         if status_type == "new":
                             stats["new_count"] += 1
@@ -576,6 +770,7 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
                             stats["restored_count"] += 1
                         elif status_type == "skipped":
                             stats["skipped_count"] += 1
+
 
             except Exception as e:
                 if stop_event and stop_event.is_set():
@@ -663,6 +858,7 @@ def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db
 
         base_img_dir = db.get_setting("save_path", "Images")
         novel_save_format = db.get_setting("novel_save_format", "epub")
+        ugoira_save_format = db.get_setting("ugoira_save_format", "gif")
         use_work_folder = db.get_setting("use_work_folder", "0") == "1"
 
         safe_title = sanitize_filename(title)
@@ -744,6 +940,27 @@ def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db
                     db.add_failed_job(work_id, user_id, title, work_type, reason)
                 else:
                     db.remove_failed_job(work_id)
+
+            elif work_type in (2, "ugoira"):
+                is_ok, reason, saved_file_paths = save_ugoira(
+                    client, work_id, title, str(user_id), user_name,
+                    work_img_dir, use_work_folder, safe_title,
+                    lambda: None, log, db, ugoira_save_format
+                )
+                if not is_ok:
+                    log(f"品質チェック/保存異常を検出しました (ID: {work_id}): {reason}", "WARNING")
+                    db.add_failed_job(work_id, str(user_id), title, "ugoira", reason)
+                else:
+                    is_valid, reason = verify_work_integrity(
+                        work_img_dir if ugoira_save_format == "folder" else saved_file_paths[0],
+                        file_paths=saved_file_paths if ugoira_save_format == "folder" else [saved_file_paths[0]]
+                    )
+                    if not is_valid:
+                        log(f"品質チェック異常を検出しました (ID: {work_id}): {reason}", "WARNING")
+                        db.add_failed_job(work_id, str(user_id), title, "ugoira", reason)
+                    else:
+                        db.upsert_work(work_id, str(user_id), title, page_count, create_date, update_date, content_type='ugoira')
+                        db.remove_failed_job(work_id)
 
             else:
                 img_urls = client.get_image_urls(work_id)
@@ -836,12 +1053,12 @@ def run_batch_backup(user_ids: list[str], client: PixivClient, db: Database, is_
             
     def check_state():
         if stop_event and stop_event.is_set():
-            raise Exception("一括処理がユーザーによって中止されました。")
+            raise StopRequested("一括処理がユーザーによって中止されました。")
         if pause_event and pause_event.is_set():
             log("一括処理を一時停止しています...")
             while pause_event.is_set():
                 if stop_event and stop_event.is_set():
-                    raise Exception("一括処理がユーザーによって中止されました。")
+                    raise StopRequested("一括処理がユーザーによって中止されました。")
                 pause_event.wait(timeout=1.0)
             log("一括処理を再開します。")
 
@@ -967,6 +1184,7 @@ def check_work_exists_on_disk(work_id, db, base_img_dir: str, bookmark_base_dir:
 
     use_work_folder = db.get_setting("use_work_folder", "0") == "1"
     novel_save_format = db.get_setting("novel_save_format", "epub")
+    ugoira_save_format = db.get_setting("ugoira_save_format", "gif")
     bookmark_download_mode = db.get_setting("bookmark_download_mode", "direct")
 
     # ブックマークの direct モードの場合、bookmark_base_dir への保存をチェックする
@@ -1000,6 +1218,19 @@ def check_work_exists_on_disk(work_id, db, base_img_dir: str, bookmark_base_dir:
                 return os.path.exists(os.path.join(user_dir, f"{work_id}.epub"))
             else:
                 return os.path.exists(os.path.join(user_dir, f"{work_id}.txt"))
+    elif content_type == 'ugoira':
+        if use_work_folder:
+            work_dir = os.path.join(user_dir, str(work_id))
+            return os.path.exists(work_dir)
+        else:
+            work_record_title = dict(work_record).get('title', '無題') if work_record else '無題'
+            safe_t = sanitize_filename(work_record_title)
+            if ugoira_save_format == "folder":
+                return os.path.exists(os.path.join(user_dir, f"{safe_t[:30]}({work_id})"))
+            elif ugoira_save_format == "mp4":
+                return os.path.exists(os.path.join(user_dir, f"{safe_t}_{work_id}.mp4")) or os.path.exists(os.path.join(user_dir, f"{safe_t}.mp4"))
+            else:
+                return os.path.exists(os.path.join(user_dir, f"{safe_t}_{work_id}.gif")) or os.path.exists(os.path.join(user_dir, f"{safe_t}.gif"))
     return False
 def download_bookmarks(db: Database, client: PixivClient, my_user_id: str, target_type: str = "both", rest_type: str = "show", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None):
     logger = logging.getLogger(__name__)
@@ -1027,12 +1258,12 @@ def download_bookmarks(db: Database, client: PixivClient, my_user_id: str, targe
 
     def check_state():
         if stop_event and stop_event.is_set():
-            raise Exception("処理がユーザーによって中止されました。")
+            raise StopRequested("処理がユーザーによって中止されました。")
         if pause_event and pause_event.is_set():
             log("処理を一時停止しています...", "INFO")
             while pause_event.is_set():
                 if stop_event and stop_event.is_set():
-                    raise Exception("処理がユーザーによって中止されました。")
+                    raise StopRequested("処理がユーザーによって中止されました。")
                 pause_event.wait(timeout=1.0)
             log("処理を再開します。", "INFO")
 
@@ -1051,6 +1282,7 @@ def download_bookmarks(db: Database, client: PixivClient, my_user_id: str, targe
     log("【フェーズB】画像のダウンロードとDBの更新を行います。")
     base_img_dir = db.get_setting("save_path", "Images")
     novel_save_format = db.get_setting("novel_save_format", "epub")
+    ugoira_save_format = db.get_setting("ugoira_save_format", "gif")
     use_work_folder = db.get_setting("use_work_folder", "0") == "1"
     enable_hardlink = db.get_setting("enable_bookmark_hardlink", "1") == "1"
     
@@ -1196,7 +1428,27 @@ def download_bookmarks(db: Database, client: PixivClient, my_user_id: str, targe
                         
                     db.upsert_work(work_id, user_id, title, page_count, create_date, update_date, content_type='novel')
                     log(f"作品DBを更新しました: {title}", "DEBUG")
-                    
+
+                elif work.get("type") in (2, "ugoira"):
+                    is_ok, reason, saved_file_paths = save_ugoira(
+                        client, work_id, title, user_id, user_name,
+                        work_img_dir, use_work_folder, safe_title,
+                        check_state, log, db, ugoira_save_format
+                    )
+                    if not is_ok:
+                        log(f"うごイラ作品の保存に失敗しました (ID: {work_id}): {reason}", "WARNING")
+                        continue
+
+                    is_valid, reason = verify_work_integrity(
+                        work_img_dir if ugoira_save_format == "folder" else saved_file_paths[0],
+                        file_paths=saved_file_paths if ugoira_save_format == "folder" else [saved_file_paths[0]]
+                    )
+                    if not is_valid:
+                        log(f"うごイラ作品の品質チェック異常を検出しました (ID: {work_id}): {reason}", "WARNING")
+                    else:
+                        db.upsert_work(work_id, user_id, title, page_count, create_date, update_date, content_type='ugoira')
+                        log(f"作品DBを更新しました: {title}", "DEBUG")
+
                 else:
                     img_urls = client.get_image_urls(work_id)
                     if not img_urls:

@@ -1,8 +1,6 @@
 import os
 import sys
 import shutil
-import tkinter as tk
-from tkinter import filedialog
 import flet as ft
 import threading
 import logging
@@ -90,13 +88,18 @@ request_stop_all = [None]
 gui_set_flow_active = [None]
 
 
-def main_window(page: ft.Page):
+def main_window(page: ft.Page, db: Database = None, scheduler=None):
     page.title = "PixivVault"
     page.theme_mode = ft.ThemeMode.DARK
     page.theme = ft.Theme(color_scheme_seed="#0096FA")
     page.dark_theme = ft.Theme(color_scheme_seed="#0096FA")
 
-    db = Database()
+    if db is None:
+        db = Database()
+
+    def _notify_scheduler():
+        if scheduler and hasattr(scheduler, "on_settings_changed"):
+            scheduler.on_settings_changed()
 
     # page.update() はスレッドセーフではないため、複数のバックグラウンドスレッド
     # （ダウンロード処理・_EtaTimer 等）から同時に呼ぶと "Frozen controls cannot be
@@ -169,26 +172,34 @@ def main_window(page: ft.Page):
     list_expanded = [False]
     def toggle_list_expansion(e=None):
         list_expanded[0] = not list_expanded[0]
-        log_container.visible = not list_expanded[0]
-        _safe_page_update()
+        with _ui_update_lock:
+            log_container.visible = not list_expanded[0]
+            page.update()
 
     def append_log(msg: str, color: str = ft.Colors.ON_SURFACE):
         time_str = datetime.now().strftime("%y%m%d %H:%M:%S")
         final_color = get_adjusted_color(color)
-        log_area.controls.append(ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500))
-        _safe_page_update()
+        with _ui_update_lock:
+            log_area.controls.append(ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500))
+            # 1000件超過分は先頭から削除してメモリリークを防止する
+            if len(log_area.controls) > 1000:
+                del log_area.controls[0]
+            page.update()
     def handle_log(msg: str):
         append_log(msg)
     def handle_alert(msg: str):
         append_log(f"[!] {msg}", color=ft.Colors.RED_400)
-    
+
     gui_log_callback[0] = handle_log
+    if scheduler:
+        scheduler.log_callback = append_log
 
     login_status_text = ft.Text("ログインチェック中...", color=ft.Colors.PRIMARY, size=13, weight=ft.FontWeight.W_500)
 
     def clear_user_id_field(e):
-        user_id_field.value = ""
-        _safe_update(user_id_field)
+        with _ui_update_lock:
+            user_id_field.value = ""
+            user_id_field.update()
 
     user_id_field = ft.TextField(
         label="PixivユーザーID",
@@ -294,12 +305,21 @@ def main_window(page: ft.Page):
         user_id = user_id_field.value.strip()
         if not user_id:
             append_log("ユーザーIDを入力してください。", color=ft.Colors.ERROR)
+            with _ui_update_lock:
+                run_btn.disabled = False
+                page.update()
             return
         if not user_id.isdigit():
             append_log("ユーザーIDは数字のみ入力してください (PixivのユーザーページURLの末尾の数字です)。", color=ft.Colors.ERROR)
+            with _ui_update_lock:
+                run_btn.disabled = False
+                page.update()
             return
         if not os.path.exists("cookies.txt"):
             handle_alert("cookies.txt が見つかりません。設定ボタンからインポートしてください。")
+            with _ui_update_lock:
+                run_btn.disabled = False
+                page.update()
             return
 
         is_full = (mode_dropdown.value == "full")
@@ -318,7 +338,7 @@ def main_window(page: ft.Page):
         _single_eta_timer.start()
 
         try:
-            client = PixivClient()
+            client = PixivClient(db=db)
             run_backup(
                 user_id=user_id, client=client, db=db, is_full=is_full, target_type=target_type,
                 log_callback=handle_log, progress_callback=handle_progress,
@@ -343,7 +363,13 @@ def main_window(page: ft.Page):
             _set_flow_active("single", False)
             set_ui_disabled_single(False, is_running=False)
 
-    run_btn.on_click = lambda _: threading.Thread(target=run_backup_thread, daemon=True).start()
+    def on_run_click(e):
+        # 連打を防ぐため、スレッド起動前に即座にボタンを無効化する
+        with _ui_update_lock:
+            run_btn.disabled = True
+            page.update()
+        threading.Thread(target=run_backup_thread, daemon=True).start()
+    run_btn.on_click = on_run_click
 
     tab1_content = ft.Column([
         ft.Row([user_id_field, mode_dropdown, target_type_dropdown, run_btn, pause_btn, stop_btn, export_btn], wrap=True),
@@ -367,8 +393,9 @@ def main_window(page: ft.Page):
 
     def hide_batch_summary(e=None):
         if batch_summary_card is not None and batch_summary_card.visible:
-            batch_summary_card.visible = False
-            _safe_page_update()
+            with _ui_update_lock:
+                batch_summary_card.visible = False
+                page.update()
 
     batch_target_type_dropdown = ft.Dropdown(
         label="対象", width=160,
@@ -384,8 +411,9 @@ def main_window(page: ft.Page):
 
     def clear_search_field(e):
         hide_batch_summary()
-        search_field.value = ""
-        _safe_update(search_field)
+        with _ui_update_lock:
+            search_field.value = ""
+            search_field.update()
         load_follow_list_ui(search_val_override="")
 
     search_field = ft.TextField(
@@ -436,53 +464,54 @@ def main_window(page: ft.Page):
     def load_follow_list_ui(search_val_override=None):
         # 現在のチェックボックスの選択状態を退避
         saved_states = {uid: cb.value for uid, cb in follow_checkboxes.items()}
-        
-        follow_list_view.controls.clear()
-        follow_checkboxes.clear()
+
         users = db.get_following_users(sort_by=sort_by_dropdown.value, sort_order=sort_order_dropdown.value)
-        
+
         # 検索値: 引数優先、なければフィールドから取得
         search_q = search_val_override if search_val_override is not None else (search_field.value or "")
         search_q = search_q.strip().lower()
         if search_q:
             users = [u for u in users if search_q in (u.get('name') or '').lower() or search_q in str(u.get('user_id', '')).lower()]
-        
-        follow_count_text.value = str(len(users))
 
         def toggle_zip(e, uid):
             btn = e.control
             is_zipped = btn.icon == ft.Icons.ARCHIVE
             new_val = not is_zipped
             db.set_zipped(uid, new_val)
-            btn.icon = ft.Icons.ARCHIVE if new_val else ft.Icons.ARCHIVE_OUTLINED
-            btn.icon_color = ft.Colors.BLUE_400 if new_val else ft.Colors.GREY_500
-            _safe_page_update()
+            with _ui_update_lock:
+                btn.icon = ft.Icons.ARCHIVE if new_val else ft.Icons.ARCHIVE_OUTLINED
+                btn.icon_color = ft.Colors.BLUE_400 if new_val else ft.Colors.GREY_500
+                page.update()
 
         def toggle_favorite(e, uid):
             btn = e.control
             is_fav = btn.icon == ft.Icons.STAR
             new_val = not is_fav
             db.set_favorite(uid, new_val)
-            btn.icon = ft.Icons.STAR if new_val else ft.Icons.STAR_BORDER
-            btn.icon_color = ft.Colors.YELLOW_600 if new_val else ft.Colors.GREY_500
-            _safe_page_update()
+            with _ui_update_lock:
+                btn.icon = ft.Icons.STAR if new_val else ft.Icons.STAR_BORDER
+                btn.icon_color = ft.Colors.YELLOW_600 if new_val else ft.Colors.GREY_500
+                page.update()
 
+        new_rows = []
+        new_checkboxes = {}
         for u in users:
             label = f"{u['name']} (ID:{u['user_id']})"
             if u.get('last_downloaded'):
                 label += f" [最終: {u['last_downloaded'][:10]}]"
-                
+
             # 退避しておいた選択状態を復元（デフォルトは False）
             cb = ft.Checkbox(
                 value=saved_states.get(u['user_id'], False),
                 on_change=lambda e: hide_batch_summary()
             )
-            follow_checkboxes[u['user_id']] = cb
+            new_checkboxes[u['user_id']] = cb
 
             def on_label_tap(e, cb_ref=cb):
                 hide_batch_summary()
-                cb_ref.value = not cb_ref.value
-                _safe_page_update()
+                with _ui_update_lock:
+                    cb_ref.value = not cb_ref.value
+                    page.update()
                 
             gd_content = ft.Container(
                 content=ft.Text(label),
@@ -575,11 +604,19 @@ def main_window(page: ft.Page):
             )
 
             row = ft.Row([cb, fav_btn, gd, override_btn, zip_btn], key=str(u['user_id']))
-            follow_list_view.controls.append(row)
+            new_rows.append(row)
 
-        # 明示的にListViewとページを更新
-        _safe_update(follow_list_view)
-        _safe_page_update()
+        # follow_checkboxes/follow_list_view/follow_count_text への反映と
+        # ページ更新をひとつのロック区間にまとめ、他スレッドの page.update() と
+        # 競合して "Frozen controls cannot be updated" にならないようにする。
+        with _ui_update_lock:
+            follow_checkboxes.clear()
+            follow_checkboxes.update(new_checkboxes)
+            follow_list_view.controls.clear()
+            follow_list_view.controls.extend(new_rows)
+            follow_count_text.value = str(len(users))
+            follow_list_view.update()
+            page.update()
         
     search_field.on_change  = lambda e: (hide_batch_summary(), load_follow_list_ui(search_val_override=e.control.value))
 
@@ -648,9 +685,15 @@ def main_window(page: ft.Page):
         selected_ids = [uid for uid, cb in follow_checkboxes.items() if cb.value]
         if not selected_ids:
             append_log("ダウンロードする作者を選択してください。", color=ft.Colors.ERROR)
+            with _ui_update_lock:
+                batch_run_btn.disabled = False
+                page.update()
             return
         if not os.path.exists("cookies.txt"):
             handle_alert("cookies.txt が見つかりません。")
+            with _ui_update_lock:
+                batch_run_btn.disabled = False
+                page.update()
             return
 
         append_log(f"--- {len(selected_ids)}人の一括ダウンロードを開始します ---", color=ft.Colors.BLUE_300)
@@ -667,7 +710,7 @@ def main_window(page: ft.Page):
         _batch_eta_timer.start()
 
         try:
-            client = PixivClient()
+            client = PixivClient(db=db)
             target_type = batch_target_type_dropdown.value
             with _ui_update_lock:
                 batch_summary_card.visible = False
@@ -708,7 +751,13 @@ def main_window(page: ft.Page):
             set_ui_disabled_batch(False, is_running=False)
             load_follow_list_ui()
 
-    batch_run_btn.on_click = lambda _: threading.Thread(target=run_batch_thread, daemon=True).start()
+    def on_batch_run_click(e):
+        # 連打を防ぐため、スレッド起動前に即座にボタンを無効化する
+        with _ui_update_lock:
+            batch_run_btn.disabled = True
+            page.update()
+        threading.Thread(target=run_batch_thread, daemon=True).start()
+    batch_run_btn.on_click = on_batch_run_click
 
     def on_batch_pause(e):
         with _ui_update_lock:
@@ -723,7 +772,10 @@ def main_window(page: ft.Page):
             page.update()
 
     batch_pause_btn.on_click = on_batch_pause
-    batch_stop_btn.on_click  = lambda _: batch_stop_event.set()
+    def _on_batch_stop(e):
+        batch_stop_event.set()
+        batch_pause_event.set()  # 一時停止中でも即座にスレッドを起こす
+    batch_stop_btn.on_click  = _on_batch_stop
 
     def on_select_all(e):
         hide_batch_summary()
@@ -781,17 +833,21 @@ def main_window(page: ft.Page):
 
     # タブ1 共通イベント
     def on_pause_click(e):
-        if single_pause_event.is_set():
-            single_pause_event.clear()
-            pause_btn.text = "一時停止"
-            pause_btn.icon = ft.Icons.PAUSE
-        else:
-            single_pause_event.set()
-            pause_btn.text = "再開"
-            pause_btn.icon = ft.Icons.PLAY_ARROW
-        _safe_page_update()
+        with _ui_update_lock:
+            if single_pause_event.is_set():
+                single_pause_event.clear()
+                pause_btn.text = "一時停止"
+                pause_btn.icon = ft.Icons.PAUSE
+            else:
+                single_pause_event.set()
+                pause_btn.text = "再開"
+                pause_btn.icon = ft.Icons.PLAY_ARROW
+            page.update()
     pause_btn.on_click = on_pause_click
-    stop_btn.on_click  = lambda _: single_stop_event.set()
+    def _on_single_stop(e):
+        single_stop_event.set()
+        single_pause_event.set()  # 一時停止中でも即座にスレッドを起こす
+    stop_btn.on_click  = _on_single_stop
 
     def run_export_thread():
         append_log("--- エクスポートを開始します ---", color=ft.Colors.BLUE_300)
@@ -839,6 +895,8 @@ def main_window(page: ft.Page):
             if sys.platform == "darwin":
                 file_path = _pick_file_macos("cookies.txt を選択")
             else:
+                import tkinter as tk
+                from tkinter import filedialog
                 root = tk.Tk()
                 root.withdraw()
                 root.wm_attributes("-topmost", True)
@@ -853,19 +911,24 @@ def main_window(page: ft.Page):
                 src_path = os.path.abspath(file_path)
                 if src_path != dst_path:
                     shutil.copy2(src_path, dst_path)
-                cookie_status_text.value = "[完了] cookies.txt をインポートしました。"
-                cookie_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
-                cookie_status_text.visible = True
+                with _ui_update_lock:
+                    cookie_status_text.value = "[完了] cookies.txt をインポートしました。"
+                    cookie_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
+                    cookie_status_text.visible = True
+                    page.update()
                 threading.Thread(target=lambda: check_login_status(on_cookie_imported=True), daemon=True).start()
             else:
-                cookie_status_text.value = "キャンセルされました。"
-                cookie_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
-                cookie_status_text.visible = True
+                with _ui_update_lock:
+                    cookie_status_text.value = "キャンセルされました。"
+                    cookie_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
+                    cookie_status_text.visible = True
+                    page.update()
         except Exception as ex:
-            cookie_status_text.value = f"[失敗] {ex}"
-            cookie_status_text.color = ft.Colors.RED_400
-            cookie_status_text.visible = True
-        _safe_page_update()
+            with _ui_update_lock:
+                cookie_status_text.value = f"[失敗] {ex}"
+                cookie_status_text.color = ft.Colors.RED_400
+                cookie_status_text.visible = True
+                page.update()
 
     def _run_folder_picker():
         """保存先フォルダー選択ダイアログをバックグラウンドスレッドで実行"""
@@ -874,6 +937,8 @@ def main_window(page: ft.Page):
             if sys.platform == "darwin":
                 folder_path = _pick_folder_macos("画像の保存先フォルダーを選択")
             else:
+                import tkinter as tk
+                from tkinter import filedialog
                 root = tk.Tk()
                 root.withdraw()
                 root.wm_attributes("-topmost", True)
@@ -884,35 +949,40 @@ def main_window(page: ft.Page):
                 root.destroy()
             if folder_path:
                 db.set_setting("save_path", folder_path)
-                save_path_text.value = f"現在の保存先: {folder_path}"
+                with _ui_update_lock:
+                    save_path_text.value = f"現在の保存先: {folder_path}"
+                    page.update()
                 append_log(f"保存先フォルダーを {folder_path} に変更しました。")
             else:
                 append_log("フォルダー選択がキャンセルされました。")
         except Exception as ex:
             append_log(f"フォルダー選択エラー: {ex}", color=ft.Colors.RED_400)
-        _safe_page_update()
 
     def sync_follow_list():
-        sync_status_text.value = "Pixivから同期中..."
-        sync_status_text.color = get_adjusted_color(ft.Colors.BLUE_400)
-        sync_status_text.visible = True
-        _safe_page_update()
+        with _ui_update_lock:
+            sync_status_text.value = "Pixivから同期中..."
+            sync_status_text.color = get_adjusted_color(ft.Colors.BLUE_400)
+            sync_status_text.visible = True
+            page.update()
         try:
-            client = PixivClient()
+            client = PixivClient(db=db)
             my_id  = client.get_my_user_id()
             users  = client.get_following_users(my_user_id=my_id, rest_type="show", log_callback=handle_log)
             users.extend(client.get_following_users(my_user_id=my_id, rest_type="hide", log_callback=handle_log))
             db.save_following_users(users)
             db.set_setting("last_sync_date", datetime.now().isoformat())
-            sync_status_text.value = f"[完了] 同期完了 ({len(users)}人の作者)"
-            sync_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
-            sync_status_text.visible = True
+            with _ui_update_lock:
+                sync_status_text.value = f"[完了] 同期完了 ({len(users)}人の作者)"
+                sync_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
+                sync_status_text.visible = True
+                page.update()
             load_follow_list_ui()
         except Exception as e:
-            sync_status_text.value = f"[失敗] 同期失敗: {e}"
-            sync_status_text.color = ft.Colors.RED_400
-            sync_status_text.visible = True
-        _safe_page_update()
+            with _ui_update_lock:
+                sync_status_text.value = f"[失敗] 同期失敗: {e}"
+                sync_status_text.color = ft.Colors.RED_400
+                sync_status_text.visible = True
+                page.update()
 
     def on_zip_all_change(e):
         db.set_setting("zip_all_after_download", "1" if e.control.value else "0")
@@ -934,12 +1004,28 @@ def main_window(page: ft.Page):
             ft.DropdownOption("both", "EPUBとTXT両方"),
         ],
         value=db.get_setting("novel_save_format", "epub"),
-        width=300
+        width=430
     )
     novel_format_dropdown.on_change = on_novel_format_change
 
+    def on_ugoira_format_change(e):
+        db.set_setting("ugoira_save_format", e.control.value)
+
+    ugoira_format_dropdown = ft.Dropdown(
+        label="うごイラの保存形式",
+        options=[
+            ft.DropdownOption("gif", "GIF動画 (デフォルト)"),
+            ft.DropdownOption("mp4", "MP4動画"),
+            ft.DropdownOption("folder", "すべてフォルダ格納する (ZIP解凍+JSON)"),
+        ],
+        value=db.get_setting("ugoira_save_format", "gif"),
+        width=430
+    )
+    ugoira_format_dropdown.on_change = on_ugoira_format_change
+
     def on_auto_check_interval_change(e):
         db.set_setting("auto_check_interval_hours", e.control.value)
+        _notify_scheduler()
 
     auto_check_dropdown = ft.Dropdown(
         label="☆ お気に入り自動チェック間隔",
@@ -951,9 +1037,19 @@ def main_window(page: ft.Page):
             ft.DropdownOption("0", "自動チェックしない"),
         ],
         value=db.get_setting("auto_check_interval_hours", "24"),
-        width=300
+        width=430
     )
     auto_check_dropdown.on_change = on_auto_check_interval_change
+
+    def on_check_on_startup_change(e):
+        db.set_setting("check_on_startup", "1" if e.control.value else "0")
+        _notify_scheduler()
+
+    check_on_startup_checkbox = ft.Checkbox(
+        label="起動時にもお気に入り新着チェックを実行する",
+        value=db.get_setting("check_on_startup", "0") == "1",
+        on_change=on_check_on_startup_change
+    )
 
     def on_enable_notifications_change(e):
         db.set_setting("enable_notifications", e.control.value)
@@ -965,7 +1061,7 @@ def main_window(page: ft.Page):
             ft.DropdownOption("0", "OFF (通知しない)"),
         ],
         value=db.get_setting("enable_notifications", "1"),
-        width=300
+        width=430
     )
     notifications_dropdown.on_change = on_enable_notifications_change
 
@@ -1004,14 +1100,15 @@ def main_window(page: ft.Page):
                         deleted_count += 1
                     except Exception:
                         pass
-        if deleted_count > 0:
-            cache_status_text.value = f"キャッシュを削除しました ({deleted_count}件)"
-            cache_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
-        else:
-            cache_status_text.value = "キャッシュはありませんでした。"
-            cache_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
+        with _ui_update_lock:
+            if deleted_count > 0:
+                cache_status_text.value = f"キャッシュを削除しました ({deleted_count}件)"
+                cache_status_text.color = get_adjusted_color(ft.Colors.GREEN_400)
+            else:
+                cache_status_text.value = "キャッシュはありませんでした。"
+                cache_status_text.color = get_adjusted_color(ft.Colors.GREY_400)
+            page.update()
         append_log(f"画像のキャッシュを削除しました ({deleted_count}件)")
-        _safe_page_update()
 
     clear_cache_btn = ft.ElevatedButton(
         "キャッシュを削除する",
@@ -1026,12 +1123,6 @@ def main_window(page: ft.Page):
         ], spacing=4),
         padding=ft.padding.Padding(10, 6, 0, 6)
     )
-
-    advanced_settings = ft.ExpansionTile(
-        title=ft.Text("Advanced / 高度な設定", weight=ft.FontWeight.BOLD),
-        controls=[zip_all_checkbox, minimize_to_tray_checkbox, clear_cache_container]
-    )
-
 
     def on_download_interval_change(e):
         db.set_setting("download_interval", e.control.value)
@@ -1082,6 +1173,46 @@ def main_window(page: ft.Page):
     )
     api_retry_wait_dropdown.on_change = on_api_retry_wait_change
 
+    advanced_settings = ft.ExpansionTile(
+        title=ft.Text("5. Advanced / 高度な設定", weight=ft.FontWeight.BOLD),
+        controls=[
+            ft.Container(
+                content=ft.Column([
+                    download_interval_dropdown,
+                    api_retry_count_dropdown,
+                    api_retry_wait_dropdown,
+                    zip_all_checkbox,
+                    minimize_to_tray_checkbox,
+                    clear_cache_container
+                ], spacing=12),
+                padding=ft.padding.Padding(14, 14, 0, 8)
+            )
+        ]
+    )
+
+    def on_settings_close(e=None):
+        db.set_setting("check_on_startup", "1" if check_on_startup_checkbox.value else "0")
+        if auto_check_dropdown.value is not None:
+            db.set_setting("auto_check_interval_hours", str(auto_check_dropdown.value))
+        if novel_format_dropdown.value is not None:
+            db.set_setting("novel_save_format", str(novel_format_dropdown.value))
+        if ugoira_format_dropdown.value is not None:
+            db.set_setting("ugoira_save_format", str(ugoira_format_dropdown.value))
+        if notifications_dropdown.value is not None:
+            db.set_setting("enable_notifications", str(notifications_dropdown.value))
+        if bookmark_download_mode_dropdown.value is not None:
+            db.set_setting("bookmark_download_mode", str(bookmark_download_mode_dropdown.value))
+        if download_interval_dropdown.value is not None:
+            db.set_setting("download_interval", str(download_interval_dropdown.value))
+        if api_retry_count_dropdown.value is not None:
+            db.set_setting("api_retry_count", str(api_retry_count_dropdown.value))
+        if api_retry_wait_dropdown.value is not None:
+            db.set_setting("api_retry_wait", str(api_retry_wait_dropdown.value))
+        db.set_setting("zip_all_after_download", "1" if zip_all_checkbox.value else "0")
+        db.set_setting("minimize_to_tray", "1" if minimize_to_tray_checkbox.value else "0")
+        _notify_scheduler()
+        page.pop_dialog()
+
     settings_dialog = ft.AlertDialog(
         title=ft.Text("設定"),
         content=ft.Column([
@@ -1104,21 +1235,20 @@ def main_window(page: ft.Page):
             save_path_text,
             ft.Divider(),
             ft.Text("4. その他の設定", weight=ft.FontWeight.BOLD),
-            novel_format_dropdown,
+            check_on_startup_checkbox,
             auto_check_dropdown,
+            novel_format_dropdown,
+            ugoira_format_dropdown,
             notifications_dropdown,
             bookmark_download_mode_dropdown,
             ft.Divider(),
-            ft.Text("5. 通信・429レート制限制御", weight=ft.FontWeight.BOLD),
-            download_interval_dropdown,
-            api_retry_count_dropdown,
-            api_retry_wait_dropdown,
             advanced_settings,
+
             ft.Row([
-                ft.Text("v3.0 build260717", size=11, color=ft.Colors.GREY_600)
+                ft.Text("v3.0 build260718", size=11, color=ft.Colors.GREY_600)
             ], alignment=ft.MainAxisAlignment.CENTER),
             ft.Row([
-                ft.TextButton("閉じる", on_click=lambda _: page.pop_dialog())
+                ft.TextButton("閉じる", on_click=on_settings_close)
             ], alignment=ft.MainAxisAlignment.END),
         ], tight=True, width=500, height=420, scroll=ft.ScrollMode.AUTO, spacing=8),
     )
@@ -1166,32 +1296,36 @@ def main_window(page: ft.Page):
     )
 
     def toggle_theme(e):
-        if page.theme_mode == ft.ThemeMode.DARK:
-            page.theme_mode = ft.ThemeMode.LIGHT
-            theme_toggle_btn.icon = ft.Icons.DARK_MODE
-            theme_toggle_btn.tooltip = "ダークモードへ切り替え"
-        else:
-            page.theme_mode = ft.ThemeMode.DARK
-            theme_toggle_btn.icon = ft.Icons.LIGHT_MODE
-            theme_toggle_btn.tooltip = "ライトモードへ切り替え"
+        with _ui_update_lock:
+            if page.theme_mode == ft.ThemeMode.DARK:
+                page.theme_mode = ft.ThemeMode.LIGHT
+                theme_toggle_btn.icon = ft.Icons.DARK_MODE
+                theme_toggle_btn.tooltip = "ダークモードへ切り替え"
+            else:
+                page.theme_mode = ft.ThemeMode.DARK
+                theme_toggle_btn.icon = ft.Icons.LIGHT_MODE
+                theme_toggle_btn.tooltip = "ライトモードへ切り替え"
 
-        for btn in tab_buttons:
-            if btn.data != 99:
-                is_selected = (btn.data == current_tab_idx[0])
-                btn.style = ft.ButtonStyle(
-                    color=ft.Colors.PRIMARY if is_selected else ft.Colors.ON_SURFACE,
-                    bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.PRIMARY) if is_selected else ft.Colors.TRANSPARENT,
-                )
+            for btn in tab_buttons:
+                if btn.data != 99:
+                    is_selected = (btn.data == current_tab_idx[0])
+                    btn.style = ft.ButtonStyle(
+                        color=ft.Colors.PRIMARY if is_selected else ft.Colors.ON_SURFACE,
+                        bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.PRIMARY) if is_selected else ft.Colors.TRANSPARENT,
+                    )
 
-        for ctrl in log_area.controls:
-            if hasattr(ctrl, "color") and ctrl.color:
-                ctrl.color = get_adjusted_color(ctrl.color)
-        for ctrl in queue_log_area.controls:
-            if hasattr(ctrl, "color") and ctrl.color:
-                ctrl.color = get_adjusted_color(ctrl.color)
+            for ctrl in log_area.controls:
+                if hasattr(ctrl, "color") and ctrl.color:
+                    ctrl.color = get_adjusted_color(ctrl.color)
+            for ctrl in queue_log_area.controls:
+                if hasattr(ctrl, "color") and ctrl.color:
+                    ctrl.color = get_adjusted_color(ctrl.color)
 
+            page.update()
+
+        # update_ext_status() は内部で _ui_update_lock を取得するため、
+        # 上のロック区間の外で呼び出す(同一スレッドでの二重取得によるデッドロックを避けるため)。
         update_ext_status()
-        _safe_page_update()
 
     theme_toggle_btn = ft.IconButton(
         icon=ft.Icons.LIGHT_MODE, tooltip="ライトモードへ切り替え",
@@ -1199,13 +1333,25 @@ def main_window(page: ft.Page):
     )
 
     def open_settings_dialog(e=None):
-        if cookie_status_text.color:
-            cookie_status_text.color = get_adjusted_color(cookie_status_text.color)
-        if sync_status_text.color:
-            sync_status_text.color = get_adjusted_color(sync_status_text.color)
-        if cache_status_text.color:
-            cache_status_text.color = get_adjusted_color(cache_status_text.color)
-        save_path_text.color = ft.Colors.PRIMARY
+        with _ui_update_lock:
+            check_on_startup_checkbox.value = (db.get_setting("check_on_startup", "0") == "1")
+            auto_check_dropdown.value = db.get_setting("auto_check_interval_hours", "24")
+            novel_format_dropdown.value = db.get_setting("novel_save_format", "epub")
+            ugoira_format_dropdown.value = db.get_setting("ugoira_save_format", "gif")
+            notifications_dropdown.value = db.get_setting("enable_notifications", "1")
+            bookmark_download_mode_dropdown.value = db.get_setting("bookmark_download_mode", "direct")
+            download_interval_dropdown.value = db.get_setting("download_interval", "1.5")
+            api_retry_count_dropdown.value = db.get_setting("api_retry_count", "3")
+            api_retry_wait_dropdown.value = db.get_setting("api_retry_wait", "5.0")
+            zip_all_checkbox.value = (db.get_setting("zip_all_after_download", "0") == "1")
+            minimize_to_tray_checkbox.value = (db.get_setting("minimize_to_tray", "1") == "1")
+            if cookie_status_text.color:
+                cookie_status_text.color = get_adjusted_color(cookie_status_text.color)
+            if sync_status_text.color:
+                sync_status_text.color = get_adjusted_color(sync_status_text.color)
+            if cache_status_text.color:
+                cache_status_text.color = get_adjusted_color(cache_status_text.color)
+            save_path_text.color = ft.Colors.PRIMARY
         page.show_dialog(settings_dialog)
 
     settings_btn = ft.IconButton(
@@ -1225,8 +1371,9 @@ def main_window(page: ft.Page):
     )
 
     def close_cookie_banner(e=None):
-        cookie_banner.visible = False
-        _safe_update(cookie_banner)
+        with _ui_update_lock:
+            cookie_banner.visible = False
+            cookie_banner.update()
 
     cookie_banner = ft.Container(
         content=ft.Row([
@@ -1266,33 +1413,34 @@ def main_window(page: ft.Page):
 
     def update_ext_status():
         import sys
-        if sys.platform != "win32":
-            ext_status_icon.name    = ft.Icons.CHECK_CIRCLE
-            ext_status_icon.color   = ft.Colors.GREEN_400
-            ext_status_label.value  = "有効  ─  macOSのURLスキームで自動解決されます"
-            ext_status_label.color  = ft.Colors.GREEN_400
-            ext_status_detail.value = "追加の登録操作は不要です。ブラウザ拡張機能からPixivVaultを自動起動できます。"
-            ext_register_btn.disabled   = True
-            ext_unregister_btn.disabled = True
-        else:
-            is_registered = registry_helper.check_protocol_registered()
-            if is_registered:
+        with _ui_update_lock:
+            if sys.platform != "win32":
                 ext_status_icon.name    = ft.Icons.CHECK_CIRCLE
                 ext_status_icon.color   = ft.Colors.GREEN_400
-                ext_status_label.value  = "有効  ─  自動起動は登録済みです"
+                ext_status_label.value  = "有効  ─  macOSのURLスキームで自動解決されます"
                 ext_status_label.color  = ft.Colors.GREEN_400
-                ext_status_detail.value = "ブラウザ拡張機能からPixivVaultを自動で起動できる状態です。"
+                ext_status_detail.value = "追加の登録操作は不要です。ブラウザ拡張機能からPixivVaultを自動起動できます。"
                 ext_register_btn.disabled   = True
-                ext_unregister_btn.disabled = False
-            else:
-                ext_status_icon.name    = ft.Icons.CANCEL
-                ext_status_icon.color   = ft.Colors.ON_SURFACE_VARIANT
-                ext_status_label.value  = "無効  ─  自動起動は未登録です"
-                ext_status_label.color  = ft.Colors.ON_SURFACE_VARIANT
-                ext_status_detail.value = "「有効化」ボタンを押すと、拡張機能からの自動起動が使えるようになります。"
-                ext_register_btn.disabled   = False
                 ext_unregister_btn.disabled = True
-        _safe_page_update()
+            else:
+                is_registered = registry_helper.check_protocol_registered()
+                if is_registered:
+                    ext_status_icon.name    = ft.Icons.CHECK_CIRCLE
+                    ext_status_icon.color   = ft.Colors.GREEN_400
+                    ext_status_label.value  = "有効  ─  自動起動は登録済みです"
+                    ext_status_label.color  = ft.Colors.GREEN_400
+                    ext_status_detail.value = "ブラウザ拡張機能からPixivVaultを自動で起動できる状態です。"
+                    ext_register_btn.disabled   = True
+                    ext_unregister_btn.disabled = False
+                else:
+                    ext_status_icon.name    = ft.Icons.CANCEL
+                    ext_status_icon.color   = ft.Colors.ON_SURFACE_VARIANT
+                    ext_status_label.value  = "無効  ─  自動起動は未登録です"
+                    ext_status_label.color  = ft.Colors.ON_SURFACE_VARIANT
+                    ext_status_detail.value = "「有効化」ボタンを押すと、拡張機能からの自動起動が使えるようになります。"
+                    ext_register_btn.disabled   = False
+                    ext_unregister_btn.disabled = True
+            page.update()
 
     def on_register_ext(e):
         if registry_helper.register_protocol():
@@ -1389,10 +1537,11 @@ def main_window(page: ft.Page):
     def append_queue_log(msg: str, color: str = ft.Colors.ON_SURFACE):
         time_str = datetime.now().strftime("%y%m%d %H:%M:%S")
         final_color = get_adjusted_color(color)
-        queue_log_area.controls.append(
-            ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500)
-        )
-        _safe_page_update()
+        with _ui_update_lock:
+            queue_log_area.controls.append(
+                ft.Text(f"[{time_str}] {msg}", color=final_color, selectable=True, size=13, weight=ft.FontWeight.W_500)
+            )
+            page.update()
 
     gui_queue_log_callback[0] = append_queue_log
 
@@ -1457,7 +1606,7 @@ def main_window(page: ft.Page):
         bm_eta.start()
 
         try:
-            client = PixivClient()
+            client = PixivClient(db=db)
             download_bookmarks(
                 db=db, client=client, my_user_id=my_user_id,
                 target_type=bm_target_type_dropdown.value,
@@ -1492,7 +1641,10 @@ def main_window(page: ft.Page):
             _set_flow_active("bookmark", False)
 
     bm_run_btn.on_click = lambda _: threading.Thread(target=run_bookmark_download_thread, daemon=True).start()
-    bm_stop_btn.on_click = lambda _: bm_stop_event.set()
+    def _on_bm_stop(e):
+        bm_stop_event.set()
+        bm_pause_event.set()  # 一時停止中でも即座にスレッドを起こす
+    bm_stop_btn.on_click = _on_bm_stop
 
     def on_bm_pause(e):
         with _ui_update_lock:
@@ -1519,11 +1671,12 @@ def main_window(page: ft.Page):
             handle_alert("ログインチェックを完了してください。")
             return
 
-        check_unfollowed_btn.disabled = True
-        _safe_page_update()
+        with _ui_update_lock:
+            check_unfollowed_btn.disabled = True
+            page.update()
 
         try:
-            client = PixivClient()
+            client = PixivClient(db=db)
             authors = get_unfollowed_bookmark_authors(
                 db, client, my_user_id,
                 target_type=bm_target_type_dropdown.value,
@@ -1533,14 +1686,16 @@ def main_window(page: ft.Page):
         except Exception as e:
             logger.exception(f"未フォロー作者の抽出に失敗しました: {e}")
             handle_alert(f"抽出エラー: {e}")
-            check_unfollowed_btn.disabled = False
-            _safe_page_update()
+            with _ui_update_lock:
+                check_unfollowed_btn.disabled = False
+                page.update()
             return
 
         if not authors:
             handle_alert("未フォローの作者は見つかりませんでした。")
-            check_unfollowed_btn.disabled = False
-            _safe_page_update()
+            with _ui_update_lock:
+                check_unfollowed_btn.disabled = False
+                page.update()
             return
 
         # ダイアログを最初に開く（中身は空）
@@ -1561,8 +1716,9 @@ def main_window(page: ft.Page):
             page.pop_dialog()
 
         page.show_dialog(dialog)
-        check_unfollowed_btn.disabled = False
-        _safe_page_update()
+        with _ui_update_lock:
+            check_unfollowed_btn.disabled = False
+            page.update()
 
         # 作者リストを1件ずつ追加するスレッド（page.run_threadで管理）
         def load_authors():
@@ -1589,27 +1745,31 @@ def main_window(page: ft.Page):
 
                 def make_on_follow(au, fb, st):
                     def on_follow(e):
-                        fb.disabled = True
-                        _safe_page_update()
+                        with _ui_update_lock:
+                            fb.disabled = True
+                            page.update()
                         try:
                             client.follow_user(au['user_id'])
-                            db.conn.execute(
-                                "INSERT OR IGNORE INTO following_users (user_id, name, is_zipped) VALUES (?, ?, ?)",
-                                (au['user_id'], au['user_name'],
-                                 1 if db.get_setting("auto_archive_new_users", "0") == "1" else 0)
-                            )
-                            db.conn.commit()
-                            st.value = "フォロー済"
-                            st.color = ft.Colors.GREEN_400
-                            fb.visible = False
+                            with db.lock:
+                                db.conn.execute(
+                                    "INSERT OR IGNORE INTO following_users (user_id, name, is_zipped) VALUES (?, ?, ?)",
+                                    (au['user_id'], au['user_name'],
+                                     1 if db.get_setting("auto_archive_new_users", "0") == "1" else 0)
+                                )
+                            with _ui_update_lock:
+                                st.value = "フォロー済"
+                                st.color = ft.Colors.GREEN_400
+                                fb.visible = False
+                                page.update()
                             append_log(f"フォローしました: {au['user_name']} ({au['user_id']})")
                             load_follow_list_ui()
                         except Exception as ex:
-                            st.value = "失敗"
-                            st.color = ft.Colors.RED_400
-                            fb.disabled = False
+                            with _ui_update_lock:
+                                st.value = "失敗"
+                                st.color = ft.Colors.RED_400
+                                fb.disabled = False
+                                page.update()
                             append_log(f"フォロー失敗: {ex}")
-                        _safe_page_update()
                     return on_follow
 
                 follow_btn.on_click = make_on_follow(_author, follow_btn, status_text)
@@ -1627,7 +1787,8 @@ def main_window(page: ft.Page):
                     status_text
                 ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
-                lv.controls.append(row)
+                with _ui_update_lock:
+                    lv.controls.append(row)
 
                 if _author.get('thumb_url'):
                     containers_to_load.append((_author['thumb_url'], work_thumb_container))
@@ -1636,11 +1797,13 @@ def main_window(page: ft.Page):
 
                 # 5件ごとに画面更新
                 if i % 5 == 0:
-                    loading_text.value = f"{i + 1} / {len(authors)} 件を読み込み中..."
-                    _safe_page_update()
+                    with _ui_update_lock:
+                        loading_text.value = f"{i + 1} / {len(authors)} 件を読み込み中..."
+                        page.update()
 
-            loading_text.value = f"読み込み完了: {len(authors)} 人"
-            _safe_page_update()
+            with _ui_update_lock:
+                loading_text.value = f"読み込み完了: {len(authors)} 人"
+                page.update()
 
             # サムネイル高速並行読み込み (8並列)
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1664,15 +1827,17 @@ def main_window(page: ft.Page):
                     img_data, container = fut.result()
                     if img_data and session_active[0]:
                         b64 = _b64.b64encode(img_data).decode('utf-8')
-                        container.content = ft.Image(
-                            src=f"data:image/jpeg;base64,{b64}",
-                            fit="cover"
-                        )
-                        updated_count += 1
-                        # 4件ごと、あるいは最後の1件で画面更新してレスポンス向上
-                        if updated_count % 4 == 0:
-                            _safe_page_update()
-                _safe_page_update()
+                        with _ui_update_lock:
+                            container.content = ft.Image(
+                                src=f"data:image/jpeg;base64,{b64}",
+                                fit="cover"
+                            )
+                            updated_count += 1
+                            # 4件ごと、あるいは最後の1件で画面更新してレスポンス向上
+                            if updated_count % 4 == 0:
+                                page.update()
+                with _ui_update_lock:
+                    page.update()
 
         page.run_thread(load_authors)
 
@@ -1690,10 +1855,10 @@ def main_window(page: ft.Page):
     failed_list_view = ft.ListView(expand=True, spacing=5)
 
     def load_failed_queue_ui():
-        failed_list_view.controls.clear()
         jobs = db.get_failed_jobs()
+        new_items = []
         if not jobs:
-            failed_list_view.controls.append(
+            new_items.append(
                 ft.Container(
                     content=ft.Text("現在、失敗キューおよび品質異常の作品はありません ✅", color=ft.Colors.GREEN_300),
                     padding=ft.padding.Padding(0, 5, 0, 5)
@@ -1712,7 +1877,7 @@ def main_window(page: ft.Page):
                         append_log(f"作品ID: {work_id} の再試行を開始します...", ft.Colors.BLUE_300)
                         def run_r():
                             try:
-                                client = PixivClient()
+                                client = PixivClient(db=db)
                                 run_single_work_backup(work_id, is_nov, client, db, log_callback=handle_log)
                                 load_failed_queue_ui()
                             except Exception as ex:
@@ -1739,8 +1904,11 @@ def main_window(page: ft.Page):
                     padding=10,
                     border_radius=6
                 )
-                failed_list_view.controls.append(row_card)
-        _safe_page_update()
+                new_items.append(row_card)
+        with _ui_update_lock:
+            failed_list_view.controls.clear()
+            failed_list_view.controls.extend(new_items)
+            page.update()
 
     def on_retry_all_failed(e):
         jobs = db.get_failed_jobs()
@@ -1749,7 +1917,7 @@ def main_window(page: ft.Page):
             return
         append_log(f"失敗キュー全件再試行を開始します ({len(jobs)}件)...", ft.Colors.BLUE_300)
         def run_all_r():
-            client = PixivClient()
+            client = PixivClient(db=db)
             for job in jobs:
                 wid = job["work_id"]
                 is_nov = (job["work_type"] == "novel")
@@ -1807,8 +1975,9 @@ def main_window(page: ft.Page):
         # レイアウトパス（GridView の幅/列数計算）を確定させる。ここを省略すると
         # スレッド側の初回 append がまだ幅0のまま計算された GridView に対して
         # 行われ、以後の更新でも高さ0のまま描画されないことがある(Flet 0.85.3)。
-        backup_history_grid.controls.clear()
-        _safe_update(backup_history_grid)
+        with _ui_update_lock:
+            backup_history_grid.controls.clear()
+            backup_history_grid.update()
 
         def _load_history_thread():
             base_img_dir = db.get_setting("save_path", "Images")
@@ -1828,7 +1997,7 @@ def main_window(page: ft.Page):
                 return
 
             if not rows:
-                append_log("直近バックアップ履歴: 対象データがありません（works.last_backupが未設定）。", color=ft.Colors.GREY_400)
+                append_log("直近バックアップ履歴: 対象データがありません（works.last_backupが未設定）。", color=get_adjusted_color(ft.Colors.GREY_400))
                 return
 
             import glob
@@ -1970,11 +2139,12 @@ def main_window(page: ft.Page):
 
                 def make_hover_handler(target_name_container):
                     def _hover(e):
-                        target_name_container.opacity = 1 if e.data == "true" else 0
-                        # Stack の奥にある対象コントロール自身を直接 update する
-                        # （ジェスチャ元コントロールを update しても子の変更が
-                        # 確実に反映されない場合があるため）
-                        _safe_update(target_name_container)
+                        with _ui_update_lock:
+                            target_name_container.opacity = 1 if e.data == "true" else 0
+                            # Stack の奥にある対象コントロール自身を直接 update する
+                            # （ジェスチャ元コントロールを update しても子の変更が
+                            # 確実に反映されない場合があるため）
+                            target_name_container.update()
                     return _hover
 
                 # ヒットテストを確実にするため、Stack 全体を GestureDetector で
@@ -2011,11 +2181,13 @@ def main_window(page: ft.Page):
                 # 進捗表示のため10件ごとに反映（page.update()ではなくコントロール単位のupdate()を使い、
                 # 別スレッドからのUI更新をこのGridViewに限定してレースを避ける）
                 if len(cards) % 10 == 0:
-                    backup_history_grid.controls = list(cards)
-                    _safe_update(backup_history_grid)
+                    with _ui_update_lock:
+                        backup_history_grid.controls = list(cards)
+                        backup_history_grid.update()
 
-            backup_history_grid.controls = cards
-            _safe_update(backup_history_grid)
+            with _ui_update_lock:
+                backup_history_grid.controls = cards
+                backup_history_grid.update()
 
             if cards:
                 append_log(f"直近のバックアップ: {len(cards)}件のタイルを表示しました。", color=ft.Colors.GREEN_400)
@@ -2057,26 +2229,27 @@ def main_window(page: ft.Page):
             return
 
         current_tab_idx[0] = idx
-        for i, container in enumerate(tab_containers):
-            container.visible = (i == idx)
+        with _ui_update_lock:
+            for i, container in enumerate(tab_containers):
+                container.visible = (i == idx)
 
-        for btn in tab_buttons:
-            if btn.data != 99:
-                is_selected = (btn.data == idx)
-                btn.style = ft.ButtonStyle(
-                    color=ft.Colors.PRIMARY if is_selected else ft.Colors.ON_SURFACE,
-                    bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.PRIMARY) if is_selected else ft.Colors.TRANSPARENT,
-                )
+            for btn in tab_buttons:
+                if btn.data != 99:
+                    is_selected = (btn.data == idx)
+                    btn.style = ft.ButtonStyle(
+                        color=ft.Colors.PRIMARY if is_selected else ft.Colors.ON_SURFACE,
+                        bgcolor=ft.Colors.with_opacity(0.12, ft.Colors.PRIMARY) if is_selected else ft.Colors.TRANSPARENT,
+                    )
 
-        history_btn.icon_color = ft.Colors.PRIMARY if idx == 6 else None
-        # 拡張機能タブ(idx=5)と直近バックアップタブ(idx=6)ではログを非表示
-        log_container.visible = (idx not in [5, 6])
+            history_btn.icon_color = ft.Colors.PRIMARY if idx == 6 else None
+            # 拡張機能タブ(idx=5)と直近バックアップタブ(idx=6)ではログを非表示
+            log_container.visible = (idx not in [5, 6])
 
-        # 可視化の更新を先に確定させてから、直近バックアップグリッドへの
-        # データ投入を開始する。同時に行うと GridView がまだ幅0のまま
-        # レイアウトされ、以後のスレッド側 update() でも高さ0のまま
-        # 描画されないことがあるため(Flet 0.85.3)、順序を分離する。
-        _safe_page_update()
+            # 可視化の更新を先に確定させてから、直近バックアップグリッドへの
+            # データ投入を開始する。同時に行うと GridView がまだ幅0のまま
+            # レイアウトされ、以後のスレッド側 update() でも高さ0のまま
+            # 描画されないことがあるため(Flet 0.85.3)、順序を分離する。
+            page.update()
 
         if idx == 6:
             load_backup_history_ui()
@@ -2133,7 +2306,7 @@ def main_window(page: ft.Page):
     # --- 起動時バックグラウンド処理 ---
     def run_auto_sync_thread(my_id):
         try:
-            client = PixivClient()
+            client = PixivClient(db=db)
             users  = client.get_following_users(my_user_id=my_id, rest_type="show", log_callback=None)
             users.extend(client.get_following_users(my_user_id=my_id, rest_type="hide", log_callback=None))
             db.save_following_users(users)
@@ -2183,22 +2356,24 @@ def main_window(page: ft.Page):
             except Exception as ex:
                 logger.debug(f"自動抽出エラー: {ex}")
 
-        if st == "valid":
-            login_status_text.value = f"● [有効] {msg}"
-            login_status_text.color = ft.Colors.GREEN_400
-            cookie_banner.visible = False
-        elif st == "warning_yellow":
-            login_status_text.value = f"▲ [注意/残り1週間以内] {msg}"
-            login_status_text.color = ft.Colors.YELLOW_400
-            cookie_banner.visible = False
-        elif st in ["warning", "warning_red"]:
-            login_status_text.value = f"▲ [警告/残り3日以内] {msg}"
-            login_status_text.color = ft.Colors.RED_400
-            cookie_banner.visible = False
-        else:
-            login_status_text.value = f"× [未認証/期限切れ] {msg}"
-            login_status_text.color = ft.Colors.RED_400
-            cookie_banner.visible = True
+        with _ui_update_lock:
+            if st == "valid":
+                login_status_text.value = f"● [有効] {msg}"
+                login_status_text.color = ft.Colors.GREEN_400
+                cookie_banner.visible = False
+            elif st == "warning_yellow":
+                login_status_text.value = f"▲ [注意/残り1週間以内] {msg}"
+                login_status_text.color = ft.Colors.YELLOW_400
+                cookie_banner.visible = False
+            elif st in ["warning", "warning_red"]:
+                login_status_text.value = f"▲ [警告/残り3日以内] {msg}"
+                login_status_text.color = ft.Colors.RED_400
+                cookie_banner.visible = False
+            else:
+                login_status_text.value = f"× [未認証/期限切れ] {msg}"
+                login_status_text.color = ft.Colors.RED_400
+                cookie_banner.visible = True
+            page.update()
 
         if uid and st in ["valid", "warning_yellow", "warning_red", "warning"]:
             if str(uid) != str(old_user_id) and str(old_user_id) != "":
@@ -2215,7 +2390,6 @@ def main_window(page: ft.Page):
             else:
                 db.set_setting("my_user_id", str(uid))
                 trigger_auto_sync(uid)
-        _safe_page_update()
 
     # 初期化
     gui_trigger_cookie_check[0] = lambda: threading.Thread(target=check_login_status, daemon=True).start()

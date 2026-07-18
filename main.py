@@ -74,6 +74,17 @@ def ensure_branded_flet_desktop_client():
             shutil.copyfile(icon_src, icon_dst)
 
         subprocess.run(["touch", app_bundle], check=False, capture_output=True)
+
+        # Info.plist を書き換えただけではLaunchServicesのキャッシュが古い名前(Flet)を
+        # 保持し続け、Dock/Finderのツールチップが更新されないことがあるため、
+        # lsregister -f でこのバンドルの登録を強制的に再読込させる。
+        lsregister = (
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+            "LaunchServices.framework/Support/lsregister"
+        )
+        if os.path.exists(lsregister):
+            subprocess.run([lsregister, "-f", app_bundle], check=False, capture_output=True, timeout=15)
+
         open(marker, "w").close()
     except Exception as e:
         logging.getLogger(__name__).warning(f"Fletクライアントのブランディング適用に失敗しました: {e}")
@@ -116,7 +127,7 @@ def main():
     from server import start_server
     import threading
     
-    client = PixivClient()
+    client = PixivClient(db=db)
     server_thread = threading.Thread(target=start_server, args=(25010, db, client), daemon=True)
     server_thread.start()
 
@@ -141,7 +152,7 @@ def main():
         page.window.resizable = False
 
         # メインUIの構築
-        main_window(page)
+        main_window(page, db=db, scheduler=scheduler)
         
         # ウィンドウの「×」ボタンで閉じないようにする
         page.window.prevent_close = True
@@ -166,7 +177,9 @@ def main():
                             _tray_icon.stop()
                     except Exception:
                         pass
+                    db.close()
                     page.run_task(page.window.destroy)
+
 
                 def handle_no(e):
                     page.pop_dialog()
@@ -194,13 +207,24 @@ def main():
         # タスクトレイのアクション
         def on_show_clicked():
             page.window.visible = True
+            page.window.minimized = False
             page.window.to_front()
             page.update()
 
         def on_exit_clicked():
-            # アプリの完全終了
+            # アプリの完全終了（ダウンロード中の場合は安全に中断してから終了）
+            import gui
+            if gui.is_downloading_active[0] and gui.request_stop_all[0]:
+                gui.request_stop_all[0]()
             scheduler.stop()
+            try:
+                if _tray_icon:
+                    _tray_icon.stop()
+            except Exception:
+                pass
+            db.close()
             page.run_task(page.window.destroy)
+
 
         # トレイアイコンをバックグラウンドで開始
         _tray_icon = run_tray(on_show_clicked, on_exit_clicked)

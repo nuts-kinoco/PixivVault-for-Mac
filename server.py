@@ -142,6 +142,9 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         logger.debug("%s - - [%s] %s" % (self.address_string(), self.log_date_time_string(), format % args))
 
 
+_last_gui_sync_notify_time = [0]
+_last_phpsessid = [None]
+
 def save_cookies_from_extension(cookies_list):
     import os
     import time
@@ -151,61 +154,83 @@ def save_cookies_from_extension(cookies_list):
         "# This is a generated file by PixivVault Extension! Do not edit.",
         ""
     ]
+
+    old_cookies_map = {}
+    if os.path.exists("cookies.txt"):
+        try:
+            with open("cookies.txt", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    parts = line.strip().split('\t')
+                    if len(parts) >= 7:
+                        dom, sub, pth, sec, exp, nm, val = parts[:7]
+                        old_cookies_map[(dom, pth, nm)] = (val, sec, exp)
+        except Exception:
+            old_cookies_map = {}
+
     has_pixiv = False
-    for c in cookies_list:
+    new_cookies_map = {}
+    new_phpsessid = None
+
+    # (domain, path, name) で確実にソートして決定的な順序にする
+    sorted_cookies = sorted(cookies_list, key=lambda c: (c.get('domain', ''), c.get('path', '/'), c.get('name', '')))
+
+    for c in sorted_cookies:
         domain = c.get('domain', '')
         if 'pixiv.net' in domain:
             has_pixiv = True
         include_sub = "TRUE" if domain.startswith('.') else "FALSE"
         path = c.get('path', '/')
         secure = "TRUE" if c.get('secure', False) else "FALSE"
-        
+        name = c.get('name', '')
+        value = c.get('value', '')
+
+        if name == "PHPSESSID":
+            new_phpsessid = value
+
         exp = c.get('expirationDate')
         if exp is not None and isinstance(exp, (int, float)) and exp > 0:
             expires_ts = int(exp)
         else:
-            # セッションCookie等で有効期限が無い場合は30日後にしておく
-            expires_ts = int(time.time()) + 86400 * 30
-            
-        name = c.get('name', '')
-        value = c.get('value', '')
+            # セッションCookieの場合、実質的な値が変わっていないなら既存の有効期限タイムスタンプを維持する。
+            # 変更がある場合のみ、12時間単位で丸めた有効期限にして毎秒の変動を防ぐ。
+            if (domain, path, name) in old_cookies_map and old_cookies_map[(domain, path, name)][0] == value:
+                expires_ts = int(old_cookies_map[(domain, path, name)][2])
+            else:
+                expires_ts = (int(time.time()) // 43200) * 43200 + 86400 * 30
+
+        new_cookies_map[(domain, path, name)] = (value, secure, str(expires_ts))
         lines.append(f"{domain}\t{include_sub}\t{path}\t{secure}\t{expires_ts}\t{name}\t{value}")
-    
+
     if not has_pixiv:
         return False, "Pixiv cookies not found"
 
-    new_content = "\n".join(lines) + "\n"
-
-    # 内容に変化がなければファイルへの書き込みもGUI通知も行わない
-    # (ページ遷移・フォーカス毎に無条件で発火するため、無駄な書き込みとログ・スレッド生成を防ぐ)
-    old_content = None
-    if os.path.exists("cookies.txt"):
-        try:
-            with open("cookies.txt", "r", encoding="utf-8") as f:
-                old_content = f.read()
-        except Exception:
-            old_content = None
-    if old_content == new_content:
+    # 全く同じ Cookie(ドメイン, パス, 名前, 値, セキュア, 有効期限) の内容なら変更なしとしてスキップ！
+    if old_cookies_map == new_cookies_map:
         return True, "No changes"
 
+    new_content = "\n".join(lines) + "\n"
     temp_file = "cookies.txt.tmp"
     with open(temp_file, "w", encoding="utf-8") as f:
         f.write(new_content)
-    # os.replace は宛先が既に存在してもWindows/POSIX双方で原子的に上書きできる。
-    # remove→renameの2段階だとWindowsではremoveの失敗(ファイルロック中など)後に
-    # renameがFileExistsErrorで落ちるため使わない。
     os.replace(temp_file, "cookies.txt")
 
     # ログ出力＆GUIコールバック
-    try:
-        from gui import gui_queue_log_callback, gui_trigger_cookie_check
-        if gui_queue_log_callback and gui_queue_log_callback[0]:
-            # マトリックス・サイバーグリーンで表示
-            gui_queue_log_callback[0]("[Cookie Auto-Sync] 拡張機能から最新のCookieを自動同期しました", color="#00FF66")
-        if gui_trigger_cookie_check and gui_trigger_cookie_check[0]:
-            gui_trigger_cookie_check[0]()
-    except Exception as e:
-        logger.debug(f"GUI通知エラー: {e}")
+    # 実質的なCookie内容が変わった場合であっても、フォーカスや画面遷移のたびに連続してGUIログや
+    # ログイン状態確認が連発されないよう、PHPSESSIDが変わった時または前回通知から5分(300秒)以上経過した時のみ通知を行う。
+    now = time.time()
+    if new_phpsessid != _last_phpsessid[0] or (now - _last_gui_sync_notify_time[0]) >= 300:
+        _last_phpsessid[0] = new_phpsessid
+        _last_gui_sync_notify_time[0] = now
+        try:
+            from gui import gui_queue_log_callback, gui_trigger_cookie_check
+            if gui_queue_log_callback and gui_queue_log_callback[0]:
+                gui_queue_log_callback[0]("[Cookie Auto-Sync] 拡張機能から最新のCookieを自動同期しました", color="#00FF66")
+            if gui_trigger_cookie_check and gui_trigger_cookie_check[0]:
+                gui_trigger_cookie_check[0]()
+        except Exception as e:
+            logger.debug(f"GUI通知エラー: {e}")
 
     return True, "OK"
 
@@ -278,7 +303,7 @@ class PixivVaultServer(HTTPServer):
                     logger.debug(f"GUIキューログ転送エラー: {e}")
 
             # Cookie更新をアプリ再起動なしに反映させるため、起動時に使い回すのではなく都度生成する
-            client = PixivClient()
+            client = PixivClient(db=self.db)
             log_cb(f"=== ユーザーID: {user_id} のバックアップ開始 ===")
 
             run_backup(user_id=user_id, client=client, db=self.db, target_type="both", log_callback=log_cb, new_only=new_only)
@@ -327,7 +352,7 @@ class PixivVaultServer(HTTPServer):
                     logger.debug(f"GUIキューログ転送エラー: {e}")
 
             # Cookie更新をアプリ再起動なしに反映させるため、起動時に使い回すのではなく都度生成する
-            client = PixivClient()
+            client = PixivClient(db=self.db)
             log_cb(f"=== {type_str} ID: {work_id} の保存開始 ===")
 
             run_single_work_backup(work_id=work_id, is_novel=is_novel, client=client, db=self.db, log_callback=log_cb)
