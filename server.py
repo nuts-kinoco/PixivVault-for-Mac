@@ -636,18 +636,45 @@ class PixivVaultServer(ThreadingHTTPServer):
         while True:
             task = self.web_download_queue.get()
             job_id = task['jobId']
+            kind = task['kind']
+            target_id = task['id']
             try:
                 self.update_web_job(job_id, state='running', message='開始しました')
-                self._run_web_download_job(job_id, task['kind'], task['id'], task.get('options'))
+                self._run_web_download_job(job_id, kind, target_id, task.get('options'))
                 self.update_web_job(job_id, state='done', message='完了しました')
                 job = self.get_web_job(job_id)
                 if job is not None:
                     self.update_web_job(job_id, done=job.get('total', 1))
+                self._notify_web_job_result(kind, target_id, success=True)
             except Exception as e:
                 logger.exception(f"[natsukino.com連携] ジョブ失敗 ({job_id}): {e}")
                 self.update_web_job(job_id, state='error', message=str(e))
+                self._notify_web_job_result(kind, target_id, success=False, error_message=str(e))
             finally:
                 self.web_download_queue.task_done()
+
+    def _notify_web_job_result(self, kind, target_id, success, error_message=None):
+        """個別DL等と同じ「--- ...完了しました ---」形式のログを、キューログだけでなく
+        メインログにも出す。従来はキューログにのみ受信ログが出て終わっていたため、
+        実際にダウンロードが進行/完了しているかが分かりにくいという指摘を受けて追加した。"""
+        if success:
+            queue_message = f"[アプリ連携] ダウンロード完了: {kind} (id={target_id})"
+            main_message = f"--- [アプリ連携] ダウンロードが完了しました: {kind} (id={target_id}) ---"
+            color = "#00FF66"
+            logger.info(main_message)
+        else:
+            queue_message = f"[アプリ連携] ダウンロード失敗: {kind} (id={target_id}): {error_message}"
+            main_message = f"--- [アプリ連携] ダウンロードに失敗しました: {kind} (id={target_id}): {error_message} ---"
+            color = "#FF5555"
+            logger.error(main_message)
+        try:
+            from gui import gui_queue_log_callback, gui_log_callback
+            if gui_queue_log_callback and gui_queue_log_callback[0]:
+                gui_queue_log_callback[0](queue_message, color=color)
+            if gui_log_callback and gui_log_callback[0]:
+                gui_log_callback[0](main_message, color=color)
+        except Exception as e:
+            logger.debug(f"GUI通知エラー: {e}")
 
     def _run_web_download_job(self, job_id, kind, target_id, options=None):
         # Cookie更新をアプリ再起動なしに反映させるため、都度クライアントを生成する

@@ -188,8 +188,8 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
             if len(log_area.controls) > 1000:
                 del log_area.controls[0]
             page.update()
-    def handle_log(msg: str):
-        append_log(msg)
+    def handle_log(msg: str, color: str = ft.Colors.ON_SURFACE):
+        append_log(msg, color=color)
     def handle_alert(msg: str):
         append_log(f"[!] {msg}", color=ft.Colors.RED_400)
 
