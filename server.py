@@ -610,25 +610,16 @@ class PixivVaultServer(ThreadingHTTPServer):
 
     def get_web_token(self):
         """iOS版の共有トークン。初回アクセス時に自動生成しDBへ永続化する。
-        iOS側のHostRelay設定画面で、このトークンをユーザー自身が入力する想定。"""
+        iOS側のHostRelay設定画面で、このトークンをユーザー自身が入力する想定。
+        GUIへの表示は呼び出し元（start_server）が起動のたびに行う。ここで即座に
+        通知しようとすると、まだ main_window() が完了していない起動直後のタイミングと
+        競合して黙って失われることがあるため、ここでは通知を試みない。"""
         token = self.db.get_setting('web_api_token', '')
         if not token:
             token = generate_web_token()
             self.db.set_setting('web_api_token', token)
-            self._announce_web_token(token, regenerated=False)
+            logger.info(f"[アプリ連携] Web接続トークンを新規発行しました: {token}")
         return token
-
-    def _announce_web_token(self, token, regenerated):
-        label = "再発行" if regenerated else "新規発行"
-        logger.info(f"[アプリ連携] Web接続トークンを{label}しました: {token}")
-        try:
-            from gui import gui_queue_log_callback
-            if gui_queue_log_callback and gui_queue_log_callback[0]:
-                gui_queue_log_callback[0](
-                    f"[アプリ連携] Web接続トークン({label}): {token}", color="#00FF66"
-                )
-        except Exception as e:
-            logger.debug(f"GUI通知エラー: {e}")
 
     def register_web_job(self, job_id, kind, target_id):
         with self._web_jobs_lock:
@@ -867,12 +858,24 @@ def start_server(port, db, client):
     # 新規発行時は get_web_token() 内の _announce_web_token() で既にGUIへ表示されているが、
     # 既存トークンを使い回す場合は何も表示されず「トークンがどこにも見当たらない」状態に
     # なってしまうため、既存/新規を問わず起動のたびに必ずキューログへ表示する。
-    try:
-        from gui import gui_queue_log_callback
-        if gui_queue_log_callback and gui_queue_log_callback[0]:
-            gui_queue_log_callback[0](f"[アプリ連携] 接続トークン: {token}", color="#00FF66")
-    except Exception as e:
-        logger.debug(f"GUI通知エラー: {e}")
+    #
+    # 注意: この関数は main.py が起動直後にバックグラウンドスレッドとして呼び出すため、
+    # Flet の main_window() がまだ完了しておらず gui_queue_log_callback[0] が None のままの
+    # 可能性が高い（Fletデスクトップクライアントの起動には数秒かかることがある）。
+    # 即座に1回だけ試すと通知が黙って失われるため、コールバックが登録されるまで
+    # 短い間隔でリトライする（このスレッド自体は serve_forever をブロックしないよう分離する）。
+    def _announce_startup_token():
+        for _ in range(100):  # 0.2秒 x 100 = 最大約20秒待つ
+            try:
+                from gui import gui_queue_log_callback
+                if gui_queue_log_callback and gui_queue_log_callback[0]:
+                    gui_queue_log_callback[0](f"[アプリ連携] 接続トークン: {token}", color="#00FF66")
+                    return
+            except Exception as e:
+                logger.debug(f"GUI通知エラー: {e}")
+                return
+            time.sleep(0.2)
+    threading.Thread(target=_announce_startup_token, daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
