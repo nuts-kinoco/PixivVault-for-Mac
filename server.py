@@ -22,12 +22,7 @@ logger = logging.getLogger(__name__)
 # 通せるよう、拡張機能自身とpixiv.net(のサブドメイン)からのOriginのみ許可する。
 ALLOWED_ORIGIN_PREFIX = 'chrome-extension://'
 
-# natsukino.com (要塞ホストモード) から接続する場合のデフォルト許可Origin。
-# 実際の許可リストは DB 設定 'web_allowed_origins' (JSON配列文字列) で上書き可能
-# (開発時に http://localhost:25011 等を追加したい場合などに使う)。
-DEFAULT_WEB_ALLOWED_ORIGINS = ["https://natsukino.com"]
-
-# natsukino.com からのリクエストは Origin 許可に加えて、この HTTP ヘッダ (POST/JSON時) または
+# iOS版からのリクエストは Origin 許可に加えて、この HTTP ヘッダ (POST/JSON時) または
 # クエリパラメータ (SSE等ヘッダを付けられないGET時) でトークンの一致を要求する。
 # トークンは PixivVaultServer.get_web_token() が初回アクセス時に自動生成しDBへ保存する。
 WEB_TOKEN_HEADER = 'X-PixivVault-Token'
@@ -65,16 +60,14 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         return parsed.scheme == 'https' and (host == 'pixiv.net' or host.endswith('.pixiv.net'))
 
     def _is_allowed_web_origin(self, origin):
-        # iOS版のURLSessionはブラウザと異なりOriginヘッダを送らない。ここでOrigin不在を拒否すると
-        # トークンチェック(_check_web_token/_handle_web_progressのクエリトークン)に辿り着く前に
-        # 弾かれてしまうため、Origin不在はここでは許容し、実際の認証はトークン側に委ねる
-        # (Originが送られてきた場合は従来通り許可リストと照合し、ブラウザ経由の防御は維持する)。
-        if not origin:
-            return True
-        return origin in self.server.get_web_allowed_origins()
+        """iOS版のURLSessionはブラウザと異なりOriginヘッダを送らない。この経路は現在iOS版
+        専用（natsukino.com(PixivVault Web)向けのOrigin許可リストは、Web版を技術検証で
+        終了させた際に撤去した）。Originが送られてきた時点でブラウザ等の別クライアントと
+        判断し拒否する。"""
+        return not origin
 
     def _is_allowed_origin(self, origin):
-        """CORSヘッダのエコー可否判定用。拡張機能origin・natsukino.com origin いずれかでtrue。"""
+        """CORSヘッダのエコー可否判定用。拡張機能origin・iOS版origin いずれかでtrue。"""
         return self._is_allowed_extension_origin(origin) or self._is_allowed_web_origin(origin)
 
     def _send_cors_headers(self, origin=None):
@@ -96,7 +89,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
     def _check_origin(self):
         """許可されていない Origin からのリクエストを拒否する。True を返したら処理続行可。
         既存の拡張機能連携専用エンドポイント (/api/work, /api/user/*/status, /api/cookie/sync) は
-        この関数で拡張機能origin限定のまま維持する（natsukino.com からは呼べない）。"""
+        この関数で拡張機能origin限定のまま維持する（iOS版からは呼べない）。"""
         origin = self.headers.get('Origin', '')
         if not self._is_allowed_extension_origin(origin):
             self._send_response(403, {"status": "error", "message": "Forbidden"})
@@ -104,7 +97,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def _check_web_token(self):
-        """natsukino.com 用エンドポイントの共有トークン認証。True を返したら処理続行可。"""
+        """iOS版エンドポイントの共有トークン認証。True を返したら処理続行可。"""
         token = self.headers.get(WEB_TOKEN_HEADER, '')
         if not token or token != self.server.get_web_token():
             self._send_response(401, {"status": "error", "message": "Invalid or missing token"})
@@ -112,7 +105,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def _check_web_bridge_enabled(self):
-        """GUIのトグルでnatsukino.com/iOS版連携が一時的に無効化されていないか確認する。
+        """GUIのトグルでiOS版連携が一時的に無効化されていないか確認する。
         拡張機能連携（_is_allowed_extension_origin側）には一切影響しない、web-origin系
         エンドポイント専用のガード。テスト時に「アプリ未接続」状態を意図的に作れるように、
         サーバー自体を落とさずに接続受け付けだけを止められるようにするためのもの。"""
@@ -122,7 +115,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
-        # /ping と /progress/<jobId> は拡張機能・natsukino.com 双方からアクセスされうるため
+        # /ping と /progress/<jobId> は拡張機能・iOS版双方からアクセスされうるため
         # 従来の拡張機能限定 _check_origin() より先に、それぞれ専用の判定へ振り分ける。
         if self.path == '/ping':
             self._handle_ping()
@@ -162,12 +155,12 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             self._send_response(404, {"status": "error", "message": "Not found"})
 
     def do_POST(self):
-        # /download は拡張機能(既存プロトコル)と natsukino.com (新プロトコル) の両方が叩くため、
+        # /download は拡張機能(既存プロトコル)とiOS版(新プロトコル) の両方が叩くため、
         # _check_origin() (拡張機能限定) より先に Origin 種別で振り分ける。
         if self.path == '/download':
             self._handle_download()
             return
-        # /bookmark は natsukino.com/iOS版専用（拡張機能は使わない）ため、
+        # /bookmark は iOS版専用（拡張機能は使わない）ため、
         # 最初からトークン認証のみで判定する。
         if self.path == '/bookmark':
             self._handle_bookmark()
@@ -195,12 +188,12 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             self._send_response(404, {"status": "error", "message": "Not found"})
 
     def _handle_ping(self):
-        """接続確認。natsukino.com のサイバー・グリーン点灯判定に使う。トークンは不要（到達確認のみ）。"""
+        """接続確認。接続インジケータの点灯判定に使う。トークンは不要（到達確認のみ）。"""
         origin = self.headers.get('Origin', '')
         if not self._is_allowed_origin(origin):
             self._send_response(403, {"status": "error", "message": "Forbidden"})
             return
-        # 拡張機能origin一致は「アプリ接続」とはみなさない（ブラウザ拡張とiOS/natsukino.comの
+        # 拡張機能origin一致は「アプリ接続」とはみなさない（ブラウザ拡張とiOSの
         # 接続インジケータを混同しないため、web-origin側にマッチした場合のみ記録する）。
         if self._is_allowed_web_origin(origin):
             if not self._check_web_bridge_enabled():
@@ -253,7 +246,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             self._send_response(400, {"status": "error", "message": "Invalid JSON"})
 
     def _handle_web_download(self):
-        """natsukino.com (HostSource.enqueueDownload) 用プロトコル。DownloadCommand 形式の JSON を受け取り、
+        """iOS版 (HostSource.enqueueDownload) 用プロトコル。DownloadCommand 形式の JSON を受け取り、
         既存の core.py バックアップ機構にマッピングしてジョブとしてキューへ積む。トークン必須。"""
         if not self._check_web_bridge_enabled():
             return
@@ -308,7 +301,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         self._send_response(200, {"jobId": job_id})
 
     def _handle_bookmark(self):
-        """natsukino.com/iOS版連携用: 実ブックマーク書き込みエンドポイント（Q5のB案、`/bookmark`）。
+        """iOS版連携用: 実ブックマーク書き込みエンドポイント（Q5のB案、`/bookmark`）。
         iOSは自分のCookieで直接pixivへPOSTする経路(A)を主に使うため、こちらはその代替経路。
         `pixiv_client.py`の`follow_user()`と同じ`bookmark_add.php`土台を使う
         `add_illust_bookmark`/`add_novel_bookmark`へ委譲する。
@@ -361,7 +354,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             self._send_response(500, {"status": "error", "message": str(e)})
 
     def _handle_web_progress(self):
-        """natsukino.com (HostSource.watchProgress) 用の SSE ストリーム。
+        """iOS版 (HostSource.watchProgress) 用の SSE ストリーム。
         EventSource はカスタムヘッダを送れないため、トークンはクエリパラメータで受け取る。"""
         origin = self.headers.get('Origin', '')
         if not self._is_allowed_web_origin(origin):
@@ -536,7 +529,7 @@ class PixivVaultServer(ThreadingHTTPServer):
         self.worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
         self.worker_thread.start()
 
-        # natsukino.com (要塞ホストモード) 用: 既存の enqueue()/_queued_keys 方式とは独立したキュー。
+        # iOS版（要塞ホストモード） 用: 既存の enqueue()/_queued_keys 方式とは独立したキュー。
         # リクエストごとに一意な jobId を発行し、進捗を web_jobs で追跡する (SSE配信用)。
         self.web_download_queue = queue.Queue()
         self.web_jobs = {}
@@ -544,13 +537,13 @@ class PixivVaultServer(ThreadingHTTPServer):
         self.web_worker_thread = threading.Thread(target=self._web_queue_worker, daemon=True)
         self.web_worker_thread.start()
 
-        # natsukino.com/iOS版が最後にこの要塞へ接続してきた時刻。GUI側のインジケータ表示・
+        # iOS版が最後にこの要塞へ接続してきた時刻。GUI側のインジケータ表示・
         # 「アプリと接続しました」ログの重複抑制(直近60秒以内の再接続はログを出さない)に使う。
         self._last_app_contact_at = None
         self._app_contact_lock = threading.Lock()
 
     def mark_app_contact(self):
-        """natsukino.com/iOS版からの認証済みアクセスを検知するたびに呼ぶ。
+        """iOS版からの認証済みアクセスを検知するたびに呼ぶ。
         直近60秒以内に既に検知済みなら「新規接続」とはみなさずログは出さないが、
         GUIインジケータ用のタイムスタンプは毎回更新する。"""
         now = time.time()
@@ -604,10 +597,10 @@ class PixivVaultServer(ThreadingHTTPServer):
                     self._queued_keys.discard(task.get('key'))
                 self.download_queue.task_done()
 
-    # ── natsukino.com (要塞ホストモード) ─────────────────────────────────
+    # ── iOS版（要塞ホストモード） ─────────────────────────────────
 
     def is_web_bridge_enabled(self):
-        """GUIのトグルでnatsukino.com/iOS版連携の接続受け付けを一時停止できるようにするための
+        """GUIのトグルでiOS版連携の接続受け付けを一時停止できるようにするための
         フラグ。DB設定 'web_bridge_enabled'（既定 '1'=有効）。サーバー自体は落とさず、
         テスト時に意図的な「未接続」状態を作れるようにする（拡張機能連携には影響しない）。"""
         return self.db.get_setting('web_bridge_enabled', '1') == '1'
@@ -615,22 +608,9 @@ class PixivVaultServer(ThreadingHTTPServer):
     def set_web_bridge_enabled(self, enabled: bool):
         self.db.set_setting('web_bridge_enabled', '1' if enabled else '0')
 
-    def get_web_allowed_origins(self):
-        """natsukino.com 側からの Origin 許可リスト。DB設定 'web_allowed_origins' (JSON配列文字列)
-        で上書き可能。未設定時は DEFAULT_WEB_ALLOWED_ORIGINS のみ許可する。"""
-        raw = self.db.get_setting('web_allowed_origins', '')
-        if raw:
-            try:
-                origins = json.loads(raw)
-                if isinstance(origins, list) and all(isinstance(o, str) for o in origins):
-                    return origins
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("設定 'web_allowed_origins' の形式が不正なため既定値を使用します。")
-        return DEFAULT_WEB_ALLOWED_ORIGINS
-
     def get_web_token(self):
-        """natsukino.com 用の共有トークン。初回アクセス時に自動生成しDBへ永続化する。
-        natsukino.com の接続設定画面で、このトークンをユーザー自身が入力する想定。"""
+        """iOS版の共有トークン。初回アクセス時に自動生成しDBへ永続化する。
+        iOS側のHostRelay設定画面で、このトークンをユーザー自身が入力する想定。"""
         token = self.db.get_setting('web_api_token', '')
         if not token:
             token = generate_web_token()
@@ -640,12 +620,12 @@ class PixivVaultServer(ThreadingHTTPServer):
 
     def _announce_web_token(self, token, regenerated):
         label = "再発行" if regenerated else "新規発行"
-        logger.info(f"[natsukino.com連携] Web接続トークンを{label}しました: {token}")
+        logger.info(f"[アプリ連携] Web接続トークンを{label}しました: {token}")
         try:
             from gui import gui_queue_log_callback
             if gui_queue_log_callback and gui_queue_log_callback[0]:
                 gui_queue_log_callback[0](
-                    f"[natsukino.com連携] Web接続トークン({label}): {token}", color="#00FF66"
+                    f"[アプリ連携] Web接続トークン({label}): {token}", color="#00FF66"
                 )
         except Exception as e:
             logger.debug(f"GUI通知エラー: {e}")
@@ -686,7 +666,7 @@ class PixivVaultServer(ThreadingHTTPServer):
                     self.update_web_job(job_id, done=job.get('total', 1))
                 self._notify_web_job_result(kind, target_id, success=True)
             except Exception as e:
-                logger.exception(f"[natsukino.com連携] ジョブ失敗 ({job_id}): {e}")
+                logger.exception(f"[アプリ連携] ジョブ失敗 ({job_id}): {e}")
                 self.update_web_job(job_id, state='error', message=str(e))
                 self._notify_web_job_result(kind, target_id, success=False, error_message=str(e))
             finally:
@@ -721,7 +701,7 @@ class PixivVaultServer(ThreadingHTTPServer):
         options = options or {}
 
         def log_cb(msg, color=None):
-            logger.debug(f"[natsukino.com連携] {msg}")
+            logger.debug(f"[アプリ連携] {msg}")
 
         def progress_cb(idx, total, elapsed):
             self.update_web_job(job_id, done=idx, total=total, message=f'{idx}/{total} 件処理中')
@@ -883,15 +863,14 @@ def start_server(port, db, client):
     httpd = PixivVaultServer(server_address, PixivVaultRequestHandler, db, client)
     logger.info(f"拡張機能連携サーバーを 0.0.0.0:{port} (LAN含む全インターフェース) で起動しました。")
     token = httpd.get_web_token()
-    origins = ', '.join(httpd.get_web_allowed_origins())
-    logger.info(f"[natsukino.com連携] 許可Origin: {origins} / 接続トークン: {token}")
+    logger.info(f"[アプリ連携] 接続トークン: {token}")
     # 新規発行時は get_web_token() 内の _announce_web_token() で既にGUIへ表示されているが、
     # 既存トークンを使い回す場合は何も表示されず「トークンがどこにも見当たらない」状態に
     # なってしまうため、既存/新規を問わず起動のたびに必ずキューログへ表示する。
     try:
         from gui import gui_queue_log_callback
         if gui_queue_log_callback and gui_queue_log_callback[0]:
-            gui_queue_log_callback[0](f"[natsukino.com連携] 接続トークン: {token}", color="#00FF66")
+            gui_queue_log_callback[0](f"[アプリ連携] 接続トークン: {token}", color="#00FF66")
     except Exception as e:
         logger.debug(f"GUI通知エラー: {e}")
     try:

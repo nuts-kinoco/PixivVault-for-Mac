@@ -86,7 +86,7 @@ request_stop_all = [None]
 # server.py（拡張機能連携）からもダウンロード中フラグを正しく管理できるようにするためのフック。
 # gui.py 内の GUI 発のフローと合算して is_downloading_active を管理する。
 gui_set_flow_active = [None]
-# server.py（natsukino.com/iOS版連携）が認証済みアクセスを検知するたびに呼ぶフック。
+# server.py（iOS版連携）が認証済みアクセスを検知するたびに呼ぶフック。
 # 引数は time.time() のタイムスタンプ。ヘッダの接続インジケータ表示に使う。
 gui_set_app_connected = [None]
 
@@ -199,7 +199,7 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
 
     login_status_text = ft.Text("ログインチェック中...", color=ft.Colors.PRIMARY, size=13, weight=ft.FontWeight.W_500)
 
-    # ── natsukino.com/iOS版 接続インジケータ ──────────────────────────────
+    # ── iOS版 接続インジケータ ──────────────────────────────
     # server.py が認証済みアクセス(/ping・ダウンロード命令等)を検知するたびに
     # gui_set_app_connected 経由で最終接続時刻が届く。直近60秒以内なら「接続中」、
     # それ以外は最終接続からの経過時間を表示する。10秒ごとのティッカーで自然に
@@ -249,7 +249,7 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
 
     threading.Thread(target=_app_connection_ticker, daemon=True).start()
 
-    # サーバー自体は落とさず、natsukino.com/iOS版からの接続受け付けだけをGUIから
+    # サーバー自体は落とさず、iOS版からの接続受け付けだけをGUIから
     # 手動でON/OFFできるようにするトグル（拡張機能連携には影響しない）。
     # 実機テスト時に「アプリ未接続」状態を意図的に作れるようにするためのもの。
     def _on_web_bridge_toggle_change(e):
@@ -2356,7 +2356,7 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
                 login_status_text,
                 ft.Row(
                     [app_connection_icon, app_connection_text, web_bridge_toggle,
-                     ft.Text("iOS/natsukino.com連携", size=11, color=ft.Colors.ON_SURFACE_VARIANT)],
+                     ft.Text("iOS連携", size=11, color=ft.Colors.ON_SURFACE_VARIANT)],
                     spacing=6
                 ),
             ]),

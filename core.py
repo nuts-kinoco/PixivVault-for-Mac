@@ -416,7 +416,7 @@ def run_backup(user_id: str, client: PixivClient, db: Database, is_full: bool = 
     ここで作者単位のロックを取得する。
 
     `options`: リクエスト単位でグローバル設定(db.get_setting)を上書きする任意辞書
-    （natsukino.com/iOS版連携用、P-4）。`save_path`/`novel_format`/`ugoira_format`/`zip_policy`
+    （iOS版連携用、P-4）。`save_path`/`novel_format`/`ugoira_format`/`zip_policy`
     ('zip'|'individual'|None)を指定でき、未指定キーは従来通りDB設定にフォールバックする。
     """
     with get_user_lock(user_id):
@@ -790,7 +790,7 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
     row = cursor.fetchone()
 
     # options['zip_policy']（'zip'|'individual'）が指定されていれば、DB設定・作者個別設定を
-    # 完全にバイパスしてリクエスト側の指示を優先する（natsukino.com/iOS版連携用、P-4）。
+    # 完全にバイパスしてリクエスト側の指示を優先する（iOS版連携用、P-4）。
     zip_policy = options.get("zip_policy")
     if zip_policy == "zip":
         zip_all, is_zipped = True, True
