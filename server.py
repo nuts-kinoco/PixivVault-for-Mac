@@ -32,6 +32,16 @@ DEFAULT_WEB_ALLOWED_ORIGINS = ["https://natsukino.com"]
 # トークンは PixivVaultServer.get_web_token() が初回アクセス時に自動生成しDBへ保存する。
 WEB_TOKEN_HEADER = 'X-PixivVault-Token'
 
+# 手入力しやすいよう、視認性の低い文字(0/O/1/I/L)を除いた英数字にした（LAN内限定・
+# 家庭用ルーターのNAT背後という前提での利便性優先のトレードオフ）。8桁でも
+# 31^8 ≒ 8500億通りあり、HTTPリクエスト経由の総当たりは現実的な時間では終わらない。
+WEB_TOKEN_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'
+WEB_TOKEN_LENGTH = 8
+
+
+def generate_web_token():
+    return ''.join(secrets.choice(WEB_TOKEN_ALPHABET) for _ in range(WEB_TOKEN_LENGTH))
+
 
 class PixivVaultRequestHandler(BaseHTTPRequestHandler):
     def _is_loopback_client(self):
@@ -623,7 +633,7 @@ class PixivVaultServer(ThreadingHTTPServer):
         natsukino.com の接続設定画面で、このトークンをユーザー自身が入力する想定。"""
         token = self.db.get_setting('web_api_token', '')
         if not token:
-            token = secrets.token_urlsafe(32)
+            token = generate_web_token()
             self.db.set_setting('web_api_token', token)
             self._announce_web_token(token, regenerated=False)
         return token
@@ -875,6 +885,15 @@ def start_server(port, db, client):
     token = httpd.get_web_token()
     origins = ', '.join(httpd.get_web_allowed_origins())
     logger.info(f"[natsukino.com連携] 許可Origin: {origins} / 接続トークン: {token}")
+    # 新規発行時は get_web_token() 内の _announce_web_token() で既にGUIへ表示されているが、
+    # 既存トークンを使い回す場合は何も表示されず「トークンがどこにも見当たらない」状態に
+    # なってしまうため、既存/新規を問わず起動のたびに必ずキューログへ表示する。
+    try:
+        from gui import gui_queue_log_callback
+        if gui_queue_log_callback and gui_queue_log_callback[0]:
+            gui_queue_log_callback[0](f"[natsukino.com連携] 接続トークン: {token}", color="#00FF66")
+    except Exception as e:
+        logger.debug(f"GUI通知エラー: {e}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
