@@ -214,7 +214,7 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
         # しまう（トグルは新規接続を拒否するだけで過去の接続履歴は消さない仕様）ため、
         # トグル操作に応じて即座に切り替わるようにする。
         if db.get_setting('web_bridge_enabled', '1') != '1':
-            icon_color, label = ft.Colors.RED_400, "アプリ連携: 無効（手動でOFF）"
+            icon_color, label = ft.Colors.RED_400, "アプリ: 切断中"
         else:
             last = _last_app_contact_holder[0]
             if last is None:
