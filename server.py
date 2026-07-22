@@ -2,30 +2,79 @@ import json
 import threading
 import queue
 import logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+import uuid
+import secrets
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 from notifications import send_notification
 
 from database import Database
 from pixiv_client import PixivClient
-from core import run_backup, run_single_work_backup
+from core import run_backup, run_single_work_backup, run_batch_backup, download_bookmarks
 
 logger = logging.getLogger(__name__)
 
-# 拡張機能(サービスワーカー)からのリクエストは Origin: chrome-extension://<id> になる。
-# Webページから直接 127.0.0.1 に叩かれるドライブバイ攻撃を防ぐため、この形式以外の Origin は拒否する。
+# 拡張機能のService WorkerからのリクエストはOrigin: chrome-extension://<id>になる。
+# 一方、content.js側はService Workerが応答しない場合に直接fetchするフォールバックを持っており、
+# その場合ブラウザはOriginをページ自身のもの(https://www.pixiv.net等)として送信する。
+# Webページから直接127.0.0.1に叩かれるドライブバイ攻撃を防ぎつつ、このフォールバックも
+# 通せるよう、拡張機能自身とpixiv.net(のサブドメイン)からのOriginのみ許可する。
 ALLOWED_ORIGIN_PREFIX = 'chrome-extension://'
+
+# natsukino.com (要塞ホストモード) から接続する場合のデフォルト許可Origin。
+# 実際の許可リストは DB 設定 'web_allowed_origins' (JSON配列文字列) で上書き可能
+# (開発時に http://localhost:25011 等を追加したい場合などに使う)。
+DEFAULT_WEB_ALLOWED_ORIGINS = ["https://natsukino.com"]
+
+# natsukino.com からのリクエストは Origin 許可に加えて、この HTTP ヘッダ (POST/JSON時) または
+# クエリパラメータ (SSE等ヘッダを付けられないGET時) でトークンの一致を要求する。
+# トークンは PixivVaultServer.get_web_token() が初回アクセス時に自動生成しDBへ保存する。
+WEB_TOKEN_HEADER = 'X-PixivVault-Token'
 
 
 class PixivVaultRequestHandler(BaseHTTPRequestHandler):
+    def _is_loopback_client(self):
+        """接続元がこのマシン自身かどうか。Originヘッダはブラウザが強制する値だが、iOSアプリ含む
+        任意のTCPクライアントは偽装できるため、サーバーがLAN(0.0.0.0)へバインドされた
+        2026-07-22以降、拡張機能専用エンドポイント(ノートークン)の実効的な境界はこちらになる。"""
+        return self.client_address[0] in ('127.0.0.1', '::1')
+
+    def _is_allowed_extension_origin(self, origin):
+        if not origin:
+            return False
+        if not self._is_loopback_client():
+            return False
+        if origin.startswith(ALLOWED_ORIGIN_PREFIX):
+            return True
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        host = parsed.hostname or ''
+        return parsed.scheme == 'https' and (host == 'pixiv.net' or host.endswith('.pixiv.net'))
+
+    def _is_allowed_web_origin(self, origin):
+        # iOS版のURLSessionはブラウザと異なりOriginヘッダを送らない。ここでOrigin不在を拒否すると
+        # トークンチェック(_check_web_token/_handle_web_progressのクエリトークン)に辿り着く前に
+        # 弾かれてしまうため、Origin不在はここでは許容し、実際の認証はトークン側に委ねる
+        # (Originが送られてきた場合は従来通り許可リストと照合し、ブラウザ経由の防御は維持する)。
+        if not origin:
+            return True
+        return origin in self.server.get_web_allowed_origins()
+
     def _is_allowed_origin(self, origin):
-        return bool(origin) and origin.startswith(ALLOWED_ORIGIN_PREFIX)
+        """CORSヘッダのエコー可否判定用。拡張機能origin・natsukino.com origin いずれかでtrue。"""
+        return self._is_allowed_extension_origin(origin) or self._is_allowed_web_origin(origin)
 
     def _send_cors_headers(self, origin=None):
         if origin and self._is_allowed_origin(origin):
             self.send_header('Access-Control-Allow-Origin', origin)
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Access-Control-Request-Private-Network')
+        self.send_header(
+            'Access-Control-Allow-Headers',
+            f'Content-Type, Access-Control-Request-Private-Network, {WEB_TOKEN_HEADER}'
+        )
         self.send_header('Access-Control-Allow-Private-Network', 'true')
 
     def do_OPTIONS(self):
@@ -35,14 +84,32 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _check_origin(self):
-        """許可されていない Origin からのリクエストを拒否する。True を返したら処理続行可。"""
+        """許可されていない Origin からのリクエストを拒否する。True を返したら処理続行可。
+        既存の拡張機能連携専用エンドポイント (/api/work, /api/user/*/status, /api/cookie/sync) は
+        この関数で拡張機能origin限定のまま維持する（natsukino.com からは呼べない）。"""
         origin = self.headers.get('Origin', '')
-        if not self._is_allowed_origin(origin):
+        if not self._is_allowed_extension_origin(origin):
             self._send_response(403, {"status": "error", "message": "Forbidden"})
             return False
         return True
 
+    def _check_web_token(self):
+        """natsukino.com 用エンドポイントの共有トークン認証。True を返したら処理続行可。"""
+        token = self.headers.get(WEB_TOKEN_HEADER, '')
+        if not token or token != self.server.get_web_token():
+            self._send_response(401, {"status": "error", "message": "Invalid or missing token"})
+            return False
+        return True
+
     def do_GET(self):
+        # /ping と /progress/<jobId> は拡張機能・natsukino.com 双方からアクセスされうるため
+        # 従来の拡張機能限定 _check_origin() より先に、それぞれ専用の判定へ振り分ける。
+        if self.path == '/ping':
+            self._handle_ping()
+            return
+        if self.path.startswith('/progress/'):
+            self._handle_web_progress()
+            return
         if not self._check_origin():
             return
         if self.path.startswith('/api/work/'):
@@ -75,42 +142,14 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             self._send_response(404, {"status": "error", "message": "Not found"})
 
     def do_POST(self):
+        # /download は拡張機能(既存プロトコル)と natsukino.com (新プロトコル) の両方が叩くため、
+        # _check_origin() (拡張機能限定) より先に Origin 種別で振り分ける。
+        if self.path == '/download':
+            self._handle_download()
+            return
         if not self._check_origin():
             return
-        if self.path == '/download':
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length)
-            
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                req_type = data.get('type')
-                
-                if req_type == 'user':
-                    user_id = data.get('user_id')
-                    new_only = data.get('new_only', False)
-                    if user_id:
-                        if self.server.enqueue(f"user_{user_id}", {'type': 'user', 'user_id': user_id, 'new_only': new_only}):
-                            self._send_response(200, {"status": "ok", "message": f"Queued user {user_id} backup"})
-                        else:
-                            self._send_response(200, {"status": "ok", "message": f"User {user_id} backup already queued"})
-                    else:
-                        self._send_response(400, {"status": "error", "message": "Missing user_id"})
-                elif req_type == 'work':
-                    work_id = data.get('work_id')
-                    is_novel = data.get('is_novel', False)
-                    if work_id:
-                        if self.server.enqueue(f"work_{work_id}", {'type': 'work', 'work_id': work_id, 'is_novel': is_novel}):
-                            self._send_response(200, {"status": "ok", "message": f"Queued work {work_id} backup"})
-                        else:
-                            self._send_response(200, {"status": "ok", "message": f"Work {work_id} backup already queued"})
-                    else:
-                        self._send_response(400, {"status": "error", "message": "Missing work_id"})
-                else:
-                    self._send_response(400, {"status": "error", "message": "Invalid type"})
-                    
-            except json.JSONDecodeError:
-                self._send_response(400, {"status": "error", "message": "Invalid JSON"})
-        elif self.path == '/api/cookie/sync':
+        if self.path == '/api/cookie/sync':
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length)
             try:
@@ -129,6 +168,137 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
                 self._send_response(500, {"status": "error", "message": str(e)})
         else:
             self._send_response(404, {"status": "error", "message": "Not found"})
+
+    def _handle_ping(self):
+        """接続確認。natsukino.com のサイバー・グリーン点灯判定に使う。トークンは不要（到達確認のみ）。"""
+        origin = self.headers.get('Origin', '')
+        if not self._is_allowed_origin(origin):
+            self._send_response(403, {"status": "error", "message": "Forbidden"})
+            return
+        self._send_response(200, {"status": "ok"})
+
+    def _handle_download(self):
+        origin = self.headers.get('Origin', '')
+        if self._is_allowed_extension_origin(origin):
+            self._handle_legacy_download()
+        elif self._is_allowed_web_origin(origin):
+            self._handle_web_download()
+        else:
+            self._send_response(403, {"status": "error", "message": "Forbidden"})
+
+    def _handle_legacy_download(self):
+        """既存の拡張機能連携プロトコル。挙動は変更していない。"""
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+
+        try:
+            data = json.loads(post_data.decode('utf-8'))
+            req_type = data.get('type')
+
+            if req_type == 'user':
+                user_id = data.get('user_id')
+                new_only = data.get('new_only', False)
+                if user_id:
+                    if self.server.enqueue(f"user_{user_id}", {'type': 'user', 'user_id': user_id, 'new_only': new_only}):
+                        self._send_response(200, {"status": "ok", "message": f"Queued user {user_id} backup"})
+                    else:
+                        self._send_response(200, {"status": "ok", "message": f"User {user_id} backup already queued"})
+                else:
+                    self._send_response(400, {"status": "error", "message": "Missing user_id"})
+            elif req_type == 'work':
+                work_id = data.get('work_id')
+                is_novel = data.get('is_novel', False)
+                if work_id:
+                    if self.server.enqueue(f"work_{work_id}", {'type': 'work', 'work_id': work_id, 'is_novel': is_novel}):
+                        self._send_response(200, {"status": "ok", "message": f"Queued work {work_id} backup"})
+                    else:
+                        self._send_response(200, {"status": "ok", "message": f"Work {work_id} backup already queued"})
+                else:
+                    self._send_response(400, {"status": "error", "message": "Missing work_id"})
+            else:
+                self._send_response(400, {"status": "error", "message": "Invalid type"})
+
+        except json.JSONDecodeError:
+            self._send_response(400, {"status": "error", "message": "Invalid JSON"})
+
+    def _handle_web_download(self):
+        """natsukino.com (HostSource.enqueueDownload) 用プロトコル。DownloadCommand 形式の JSON を受け取り、
+        既存の core.py バックアップ機構にマッピングしてジョブとしてキューへ積む。トークン必須。"""
+        if not self._check_web_token():
+            return
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+        try:
+            data = json.loads(post_data.decode('utf-8'))
+        except json.JSONDecodeError:
+            self._send_response(400, {"status": "error", "message": "Invalid JSON"})
+            return
+
+        target = data.get('target') or {}
+        kind = target.get('kind')
+        target_id = target.get('id')
+
+        if kind not in ('work', 'author', 'bookmarks', 'following'):
+            self._send_response(400, {"status": "error", "message": "Invalid target.kind"})
+            return
+        if kind in ('work', 'author') and not target_id:
+            self._send_response(400, {"status": "error", "message": "Missing target.id"})
+            return
+
+        job_id = uuid.uuid4().hex
+        self.server.register_web_job(job_id, kind, target_id)
+        self.server.web_download_queue.put({'jobId': job_id, 'kind': kind, 'id': target_id})
+        self._send_response(200, {"jobId": job_id})
+
+    def _handle_web_progress(self):
+        """natsukino.com (HostSource.watchProgress) 用の SSE ストリーム。
+        EventSource はカスタムヘッダを送れないため、トークンはクエリパラメータで受け取る。"""
+        origin = self.headers.get('Origin', '')
+        if not self._is_allowed_web_origin(origin):
+            self._send_response(403, {"status": "error", "message": "Forbidden"})
+            return
+
+        parsed = urllib.parse.urlsplit(self.path)
+        job_id = parsed.path[len('/progress/'):]
+        query = urllib.parse.parse_qs(parsed.query)
+        token = (query.get('token') or [''])[0]
+        if not token or token != self.server.get_web_token():
+            self._send_response(401, {"status": "error", "message": "Invalid or missing token"})
+            return
+
+        if self.server.get_web_job(job_id) is None:
+            self._send_response(404, {"status": "error", "message": "Unknown job"})
+            return
+
+        # 注意: ここで Connection: keep-alive ヘッダを送ると BaseHTTPRequestHandler.send_header() が
+        # self.close_connection = False を内部設定してしまい、ストリーム終了後は handle() が
+        # 同じソケットから次のリクエストを待ち続けて接続が塞がったままになる(クライアント側の
+        # タイムアウトまでハングして実機検証で発覚)。SSE は単発の長時間レスポンスなので、
+        # 明示的に close_connection = True にして終了後は必ずソケットを閉じさせる。
+        self.close_connection = True
+        self.send_response(200)
+        self._send_cors_headers(origin)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+
+        last_sent = None
+        try:
+            while True:
+                job = self.server.get_web_job(job_id)
+                if job is None:
+                    break
+                snapshot = json.dumps(job)
+                if snapshot != last_sent:
+                    self.wfile.write(f"data: {snapshot}\n\n".encode('utf-8'))
+                    self.wfile.flush()
+                    last_sent = snapshot
+                if job['state'] in ('done', 'error'):
+                    break
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_response(self, status_code, json_dict):
         self.send_response(status_code)
@@ -236,7 +406,12 @@ def save_cookies_from_extension(cookies_list):
 
 
 
-class PixivVaultServer(HTTPServer):
+class PixivVaultServer(ThreadingHTTPServer):
+    """/progress の SSE ストリームはジョブ完了までリクエストハンドラを長時間ブロックするため、
+    素の HTTPServer (シングルスレッド・逐次処理) のままだと SSE 接続中は他の全リクエスト
+    (拡張機能連携含む) が詰まってしまう。ThreadingHTTPServer で接続ごとにスレッドを分離する。"""
+    daemon_threads = True
+
     def __init__(self, server_address, RequestHandlerClass, db, client):
         super().__init__(server_address, RequestHandlerClass)
         self.db = db
@@ -247,6 +422,14 @@ class PixivVaultServer(HTTPServer):
         self._queued_keys_lock = threading.Lock()
         self.worker_thread = threading.Thread(target=self._queue_worker, daemon=True)
         self.worker_thread.start()
+
+        # natsukino.com (要塞ホストモード) 用: 既存の enqueue()/_queued_keys 方式とは独立したキュー。
+        # リクエストごとに一意な jobId を発行し、進捗を web_jobs で追跡する (SSE配信用)。
+        self.web_download_queue = queue.Queue()
+        self.web_jobs = {}
+        self._web_jobs_lock = threading.Lock()
+        self.web_worker_thread = threading.Thread(target=self._web_queue_worker, daemon=True)
+        self.web_worker_thread.start()
 
     def enqueue(self, key, task):
         """同一keyが投入済み/処理中でなければキューに追加する。追加した場合Trueを返す。"""
@@ -272,6 +455,137 @@ class PixivVaultServer(HTTPServer):
                 with self._queued_keys_lock:
                     self._queued_keys.discard(task.get('key'))
                 self.download_queue.task_done()
+
+    # ── natsukino.com (要塞ホストモード) ─────────────────────────────────
+
+    def get_web_allowed_origins(self):
+        """natsukino.com 側からの Origin 許可リスト。DB設定 'web_allowed_origins' (JSON配列文字列)
+        で上書き可能。未設定時は DEFAULT_WEB_ALLOWED_ORIGINS のみ許可する。"""
+        raw = self.db.get_setting('web_allowed_origins', '')
+        if raw:
+            try:
+                origins = json.loads(raw)
+                if isinstance(origins, list) and all(isinstance(o, str) for o in origins):
+                    return origins
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("設定 'web_allowed_origins' の形式が不正なため既定値を使用します。")
+        return DEFAULT_WEB_ALLOWED_ORIGINS
+
+    def get_web_token(self):
+        """natsukino.com 用の共有トークン。初回アクセス時に自動生成しDBへ永続化する。
+        natsukino.com の接続設定画面で、このトークンをユーザー自身が入力する想定。"""
+        token = self.db.get_setting('web_api_token', '')
+        if not token:
+            token = secrets.token_urlsafe(32)
+            self.db.set_setting('web_api_token', token)
+            self._announce_web_token(token, regenerated=False)
+        return token
+
+    def _announce_web_token(self, token, regenerated):
+        label = "再発行" if regenerated else "新規発行"
+        logger.info(f"[natsukino.com連携] Web接続トークンを{label}しました: {token}")
+        try:
+            from gui import gui_queue_log_callback
+            if gui_queue_log_callback and gui_queue_log_callback[0]:
+                gui_queue_log_callback[0](
+                    f"[natsukino.com連携] Web接続トークン({label}): {token}", color="#00FF66"
+                )
+        except Exception as e:
+            logger.debug(f"GUI通知エラー: {e}")
+
+    def register_web_job(self, job_id, kind, target_id):
+        with self._web_jobs_lock:
+            self.web_jobs[job_id] = {
+                'jobId': job_id,
+                'done': 0,
+                'total': 1,
+                'state': 'queued',
+                'message': f'{kind} のダウンロードを待機中です'
+            }
+
+    def get_web_job(self, job_id):
+        with self._web_jobs_lock:
+            job = self.web_jobs.get(job_id)
+            return dict(job) if job is not None else None
+
+    def update_web_job(self, job_id, **fields):
+        with self._web_jobs_lock:
+            job = self.web_jobs.get(job_id)
+            if job is not None:
+                job.update(fields)
+
+    def _web_queue_worker(self):
+        while True:
+            task = self.web_download_queue.get()
+            job_id = task['jobId']
+            try:
+                self.update_web_job(job_id, state='running', message='開始しました')
+                self._run_web_download_job(job_id, task['kind'], task['id'])
+                self.update_web_job(job_id, state='done', message='完了しました')
+                job = self.get_web_job(job_id)
+                if job is not None:
+                    self.update_web_job(job_id, done=job.get('total', 1))
+            except Exception as e:
+                logger.exception(f"[natsukino.com連携] ジョブ失敗 ({job_id}): {e}")
+                self.update_web_job(job_id, state='error', message=str(e))
+            finally:
+                self.web_download_queue.task_done()
+
+    def _run_web_download_job(self, job_id, kind, target_id):
+        # Cookie更新をアプリ再起動なしに反映させるため、都度クライアントを生成する
+        client = PixivClient(db=self.db)
+
+        def log_cb(msg, color=None):
+            logger.debug(f"[natsukino.com連携] {msg}")
+
+        def progress_cb(idx, total, elapsed):
+            self.update_web_job(job_id, done=idx, total=total, message=f'{idx}/{total} 件処理中')
+
+        if kind == 'work':
+            work = client.get_work_info(target_id)
+            is_novel = False
+            if not work:
+                work = client.get_novel_info(target_id)
+                is_novel = True
+            if not work:
+                raise Exception(f'作品ID {target_id} が見つかりませんでした')
+            self.update_web_job(job_id, total=1, message=f"{work.get('title', '無題')} を保存中")
+            run_single_work_backup(work_id=target_id, is_novel=is_novel, client=client, db=self.db, log_callback=log_cb)
+
+        elif kind == 'author':
+            run_backup(
+                user_id=target_id, client=client, db=self.db, target_type='both',
+                log_callback=log_cb, progress_callback=progress_cb, new_only=False
+            )
+
+        elif kind == 'bookmarks':
+            my_user_id = client.get_my_user_id()
+            if not my_user_id:
+                raise Exception('ログイン状態を確認できませんでした（cookies.txtをご確認ください）')
+            download_bookmarks(
+                db=self.db, client=client, my_user_id=my_user_id, target_type='both', rest_type='show',
+                log_callback=log_cb, progress_callback=progress_cb
+            )
+
+        elif kind == 'following':
+            my_user_id = client.get_my_user_id()
+            if not my_user_id:
+                raise Exception('ログイン状態を確認できませんでした（cookies.txtをご確認ください）')
+            following = client.get_following_users(my_user_id)
+            user_ids = [u['user_id'] for u in following if u.get('user_id')]
+            if not user_ids:
+                raise Exception('フォロー中のユーザーが見つかりませんでした')
+
+            def batch_progress_cb(idx, total, user_id, elapsed):
+                self.update_web_job(job_id, done=idx, total=total, message=f'{idx}/{total} 人目: {user_id}')
+
+            run_batch_backup(
+                user_ids=user_ids, client=client, db=self.db, target_type='both',
+                log_callback=log_cb, progress_callback=progress_cb,
+                batch_progress_callback=batch_progress_cb, new_only=False
+            )
+        else:
+            raise Exception(f'不明な target.kind: {kind}')
 
     def notify(self, title, message):
         try:
@@ -377,9 +691,15 @@ class PixivVaultServer(HTTPServer):
                 pass
 
 def start_server(port, db, client):
-    server_address = ('127.0.0.1', port)
+    # 0.0.0.0: iOS版(自宅LAN直結モード)がLAN内の他端末からこのサーバーへ到達できるようにするため、
+    # 2026-07-22にループバック限定から変更。拡張機能専用エンドポイントは_is_allowed_extension_origin
+    # 側でループバック接続元のみへ引き続き限定しているため、LAN上の他端末からは到達不可のまま。
+    server_address = ('0.0.0.0', port)
     httpd = PixivVaultServer(server_address, PixivVaultRequestHandler, db, client)
-    logger.info(f"拡張機能連携サーバーを 127.0.0.1:{port} で起動しました。")
+    logger.info(f"拡張機能連携サーバーを 0.0.0.0:{port} (LAN含む全インターフェース) で起動しました。")
+    token = httpd.get_web_token()
+    origins = ', '.join(httpd.get_web_allowed_origins())
+    logger.info(f"[natsukino.com連携] 許可Origin: {origins} / 接続トークン: {token}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
