@@ -408,23 +408,28 @@ def save_ugoira(
     except Exception as e:
         return False, f"うごイラ変換処理中にエラーが発生しました ({e})", []
 
-def run_backup(user_id: str, client: PixivClient, db: Database, is_full: bool = False, target_type: str = "both", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None, new_only: bool = False):
+def run_backup(user_id: str, client: PixivClient, db: Database, is_full: bool = False, target_type: str = "both", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None, new_only: bool = False, options: dict = None):
     """作者(user_id)単位で排他制御しながらバックアップを実行する。
 
     GUI手動実行・スケジューラ定期チェック・拡張機能連携キューが同じ作者を同時に処理し、
     ZIPアーカイブへの同時書き込みで破損させることを防ぐため、実処理は _run_backup_impl に委譲し、
     ここで作者単位のロックを取得する。
+
+    `options`: リクエスト単位でグローバル設定(db.get_setting)を上書きする任意辞書
+    （natsukino.com/iOS版連携用、P-4）。`save_path`/`novel_format`/`ugoira_format`/`zip_policy`
+    ('zip'|'individual'|None)を指定でき、未指定キーは従来通りDB設定にフォールバックする。
     """
     with get_user_lock(user_id):
         return _run_backup_impl(
             user_id, client, db, is_full=is_full, target_type=target_type,
             log_callback=log_callback, progress_callback=progress_callback,
             alert_callback=alert_callback, stop_event=stop_event, pause_event=pause_event,
-            new_only=new_only
+            new_only=new_only, options=options
         )
 
-def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: bool = False, target_type: str = "both", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None, new_only: bool = False):
+def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: bool = False, target_type: str = "both", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None, new_only: bool = False, options: dict = None):
     logger = logging.getLogger(__name__)
+    options = options or {}
     
     def log(msg, level="INFO"):
         if level == "INFO":
@@ -524,9 +529,9 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
     # 【フェーズC】新規・更新分（または全件）ダウンロード
     if current_works:
         log("【フェーズC】画像のダウンロードとDBの更新を行います。")
-    base_img_dir = db.get_setting("save_path", "Images")
-    novel_save_format = db.get_setting("novel_save_format", "epub")
-    ugoira_save_format = db.get_setting("ugoira_save_format", "gif")
+    base_img_dir = options.get("save_path") or db.get_setting("save_path", "Images")
+    novel_save_format = options.get("novel_format") or db.get_setting("novel_save_format", "epub")
+    ugoira_save_format = options.get("ugoira_format") or db.get_setting("ugoira_save_format", "gif")
     use_work_folder = db.get_setting("use_work_folder", "0") == "1"
     total = len(current_works)
     # 今回のダウンロード対象が0件（または全件が既に最新）の場合でも、
@@ -781,17 +786,25 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
                 continue
 
     # 【フェーズD】ダウンロード完了後のZip化判定と実行
-    zip_all = db.get_setting("zip_all_after_download", "0") == "1"
     cursor = db.conn.execute("SELECT name, is_zipped FROM following_users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
 
-    # 作者個別設定(author_settings.auto_archive)が設定されていれば、
-    # following_users.is_zipped（一覧のアーカイブアイコン）より優先して適用する。
-    override_zip = db.get_author_setting(user_id, "auto_archive", None)
-    if override_zip in ("1", "0"):
-        is_zipped = (override_zip == "1")
+    # options['zip_policy']（'zip'|'individual'）が指定されていれば、DB設定・作者個別設定を
+    # 完全にバイパスしてリクエスト側の指示を優先する（natsukino.com/iOS版連携用、P-4）。
+    zip_policy = options.get("zip_policy")
+    if zip_policy == "zip":
+        zip_all, is_zipped = True, True
+    elif zip_policy == "individual":
+        zip_all, is_zipped = False, False
     else:
-        is_zipped = bool(row['is_zipped']) if row else False
+        zip_all = db.get_setting("zip_all_after_download", "0") == "1"
+        # 作者個別設定(author_settings.auto_archive)が設定されていれば、
+        # following_users.is_zipped（一覧のアーカイブアイコン）より優先して適用する。
+        override_zip = db.get_author_setting(user_id, "auto_archive", None)
+        if override_zip in ("1", "0"):
+            is_zipped = (override_zip == "1")
+        else:
+            is_zipped = bool(row['is_zipped']) if row else False
 
     if zip_all or is_zipped:
         # 今回何もダウンロードしなかった場合(author_dir_nameが未設定)でも、ZIP化設定が
@@ -808,9 +821,10 @@ def _run_backup_impl(user_id: str, client: PixivClient, db: Database, is_full: b
     log(f"--- [結果サマリー] 〇新規: {stats['new_count']}件 | △更新: {stats['updated_count']}件 | ×削除検知: {stats['deleted_count']}件 | ↺復帰: {stats['restored_count']}件 | スキップ: {stats['skipped_count']}件 | エラー: {stats['failed_count']}件 ---")
     return stats
 
-def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db: Database, log_callback=None):
+def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db: Database, log_callback=None, options: dict = None):
     logger = logging.getLogger(__name__)
-    
+    options = options or {}
+
     def log(msg, level="INFO"):
         if level == "INFO":
             logger.info(msg)
@@ -856,9 +870,9 @@ def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db
         # 作者(user_id)単位のロックで直列化する(呼び出し元で取得済み)。
         nonlocal user_name
 
-        base_img_dir = db.get_setting("save_path", "Images")
-        novel_save_format = db.get_setting("novel_save_format", "epub")
-        ugoira_save_format = db.get_setting("ugoira_save_format", "gif")
+        base_img_dir = options.get("save_path") or db.get_setting("save_path", "Images")
+        novel_save_format = options.get("novel_format") or db.get_setting("novel_save_format", "epub")
+        ugoira_save_format = options.get("ugoira_format") or db.get_setting("ugoira_save_format", "gif")
         use_work_folder = db.get_setting("use_work_folder", "0") == "1"
 
         safe_title = sanitize_filename(title)
@@ -1011,11 +1025,18 @@ def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db
             log(f"following_users の登録/取得に失敗しました (ID: {user_id}): {e}", "ERROR")
             row, created = None, False
 
-        override_zip = db.get_author_setting(user_id, "auto_archive", None)
-        if override_zip in ("1", "0"):
-            is_zipped = (override_zip == "1")
+        zip_policy = options.get("zip_policy")
+        if zip_policy == "zip":
+            zip_all, is_zipped = True, True
+        elif zip_policy == "individual":
+            zip_all, is_zipped = False, False
         else:
-            is_zipped = bool(row['is_zipped']) if row else auto_archive
+            override_zip = db.get_author_setting(user_id, "auto_archive", None)
+            if override_zip in ("1", "0"):
+                is_zipped = (override_zip == "1")
+            else:
+                is_zipped = bool(row['is_zipped']) if row else auto_archive
+            zip_all = db.get_setting("zip_all_after_download", "0") == "1"
         if row:
             if user_name == 'Unknown':
                 user_name = row['name']
@@ -1024,8 +1045,6 @@ def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db
 
         safe_user_name = sanitize_filename(user_name)
         author_dir_name = f"{safe_user_name}({user_id})"
-
-        zip_all = db.get_setting("zip_all_after_download", "0") == "1"
 
         if zip_all or is_zipped:
             author_dir = os.path.join(base_img_dir, author_dir_name)
@@ -1040,7 +1059,8 @@ def run_single_work_backup(work_id: str, is_novel: bool, client: PixivClient, db
 
 def run_batch_backup(user_ids: list[str], client: PixivClient, db: Database, is_full: bool = False, target_type: str = "both",
                      log_callback=None, progress_callback=None, alert_callback=None,
-                     stop_event=None, pause_event=None, batch_progress_callback=None, new_only: bool = False):
+                     stop_event=None, pause_event=None, batch_progress_callback=None, new_only: bool = False,
+                     options: dict = None):
     logger = logging.getLogger(__name__)
     
     def log(msg, level="INFO"):
@@ -1084,7 +1104,7 @@ def run_batch_backup(user_ids: list[str], client: PixivClient, db: Database, is_
                 user_id=user_id, client=client, db=db, is_full=is_full, target_type=target_type,
                 log_callback=log_callback, progress_callback=progress_callback,
                 alert_callback=alert_callback, stop_event=stop_event, pause_event=pause_event,
-                new_only=new_only
+                new_only=new_only, options=options
             )
             if u_stats and isinstance(u_stats, dict):
                 for k in total_stats:
@@ -1232,9 +1252,10 @@ def check_work_exists_on_disk(work_id, db, base_img_dir: str, bookmark_base_dir:
             else:
                 return os.path.exists(os.path.join(user_dir, f"{safe_t}_{work_id}.gif")) or os.path.exists(os.path.join(user_dir, f"{safe_t}.gif"))
     return False
-def download_bookmarks(db: Database, client: PixivClient, my_user_id: str, target_type: str = "both", rest_type: str = "show", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None):
+def download_bookmarks(db: Database, client: PixivClient, my_user_id: str, target_type: str = "both", rest_type: str = "show", log_callback=None, progress_callback=None, alert_callback=None, stop_event=None, pause_event=None, options: dict = None):
     logger = logging.getLogger(__name__)
-    
+    options = options or {}
+
     def log(msg, level="INFO"):
         if level == "INFO":
             logger.info(msg)
@@ -1280,9 +1301,9 @@ def download_bookmarks(db: Database, client: PixivClient, my_user_id: str, targe
         return
         
     log("【フェーズB】画像のダウンロードとDBの更新を行います。")
-    base_img_dir = db.get_setting("save_path", "Images")
-    novel_save_format = db.get_setting("novel_save_format", "epub")
-    ugoira_save_format = db.get_setting("ugoira_save_format", "gif")
+    base_img_dir = options.get("save_path") or db.get_setting("save_path", "Images")
+    novel_save_format = options.get("novel_format") or db.get_setting("novel_save_format", "epub")
+    ugoira_save_format = options.get("ugoira_format") or db.get_setting("ugoira_save_format", "gif")
     use_work_folder = db.get_setting("use_work_folder", "0") == "1"
     enable_hardlink = db.get_setting("enable_bookmark_hardlink", "1") == "1"
     

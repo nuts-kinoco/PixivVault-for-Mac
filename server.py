@@ -147,6 +147,11 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         if self.path == '/download':
             self._handle_download()
             return
+        # /bookmark は natsukino.com/iOS版専用（拡張機能は使わない）ため、
+        # 最初からトークン認証のみで判定する。
+        if self.path == '/bookmark':
+            self._handle_bookmark()
+            return
         if not self._check_origin():
             return
         if self.path == '/api/cookie/sync':
@@ -175,6 +180,10 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         if not self._is_allowed_origin(origin):
             self._send_response(403, {"status": "error", "message": "Forbidden"})
             return
+        # 拡張機能origin一致は「アプリ接続」とはみなさない（ブラウザ拡張とiOS/natsukino.comの
+        # 接続インジケータを混同しないため、web-origin側にマッチした場合のみ記録する）。
+        if self._is_allowed_web_origin(origin):
+            self.server.mark_app_contact()
         self._send_response(200, {"status": "ok"})
 
     def _handle_download(self):
@@ -226,6 +235,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         既存の core.py バックアップ機構にマッピングしてジョブとしてキューへ積む。トークン必須。"""
         if not self._check_web_token():
             return
+        self.server.mark_app_contact()
 
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length)
@@ -246,10 +256,83 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             self._send_response(400, {"status": "error", "message": "Missing target.id"})
             return
 
+        # リクエスト単位のダウンロード形式/保存先上書き（P-4）。DownloadCommand.options に
+        # 積まれた値のみ反映し、無指定のキーは従来通りグローバル/作者別DB設定にフォールバックする
+        # (core.py の各バックアップ関数側で options.get(key) or db.get_setting(...) の形で処理)。
+        raw_options = data.get('options') or {}
+        options = {}
+        if raw_options.get('savePathOverride'):
+            options['save_path'] = raw_options['savePathOverride']
+        if raw_options.get('zipPolicy') in ('zip', 'individual'):
+            options['zip_policy'] = raw_options['zipPolicy']
+        if raw_options.get('ugoiraFormat') in ('gif', 'mp4', 'folder'):
+            options['ugoira_format'] = raw_options['ugoiraFormat']
+        if raw_options.get('novelFormat') in ('epub', 'txt', 'both'):
+            options['novel_format'] = raw_options['novelFormat']
+
         job_id = uuid.uuid4().hex
+        logger.info(f"[アプリ連携] ダウンロード命令を受信しました: kind={kind} id={target_id} options={options}")
+        try:
+            from gui import gui_queue_log_callback
+            if gui_queue_log_callback and gui_queue_log_callback[0]:
+                gui_queue_log_callback[0](f"[アプリ連携] ダウンロード命令を受信: {kind} (id={target_id})", color="#00FF66")
+        except Exception as e:
+            logger.debug(f"GUI通知エラー: {e}")
+
         self.server.register_web_job(job_id, kind, target_id)
-        self.server.web_download_queue.put({'jobId': job_id, 'kind': kind, 'id': target_id})
+        self.server.web_download_queue.put({'jobId': job_id, 'kind': kind, 'id': target_id, 'options': options})
         self._send_response(200, {"jobId": job_id})
+
+    def _handle_bookmark(self):
+        """natsukino.com/iOS版連携用: 実ブックマーク書き込みエンドポイント（Q5のB案、`/bookmark`）。
+        iOSは自分のCookieで直接pixivへPOSTする経路(A)を主に使うため、こちらはその代替経路。
+        `pixiv_client.py`の`follow_user()`と同じ`bookmark_add.php`土台を使う
+        `add_illust_bookmark`/`add_novel_bookmark`へ委譲する。
+        ⚠️ 実際にユーザーのpixivアカウントへ書き込む操作のため、まだ実機（実アカウント）検証は
+        行っていない（`DirectPixivSource.addBookmark`と同様、本番投入前に必ず実機検証すること）。"""
+        if not self._check_web_token():
+            return
+        self.server.mark_app_contact()
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+        try:
+            data = json.loads(post_data.decode('utf-8'))
+        except json.JSONDecodeError:
+            self._send_response(400, {"status": "error", "message": "Invalid JSON"})
+            return
+
+        target = data.get('target') or {}
+        kind = target.get('kind')
+        target_id = target.get('id')
+        is_private = bool(target.get('isPrivate', False))
+
+        if kind not in ('illust', 'novel'):
+            self._send_response(400, {"status": "error", "message": "Invalid target.kind"})
+            return
+        if not target_id:
+            self._send_response(400, {"status": "error", "message": "Missing target.id"})
+            return
+
+        logger.info(f"[アプリ連携] ブックマーク命令を受信しました: kind={kind} id={target_id}")
+        try:
+            from gui import gui_queue_log_callback
+            if gui_queue_log_callback and gui_queue_log_callback[0]:
+                gui_queue_log_callback[0](f"[アプリ連携] ブックマーク命令を受信: {kind} (id={target_id})", color="#00FF66")
+        except Exception as e:
+            logger.debug(f"GUI通知エラー: {e}")
+
+        client = PixivClient(db=self.server.db)
+        restrict = 1 if is_private else 0
+        try:
+            if kind == 'illust':
+                client.add_illust_bookmark(target_id, restrict=restrict)
+            else:
+                client.add_novel_bookmark(target_id, restrict=restrict)
+            self._send_response(200, {"status": "ok"})
+        except Exception as e:
+            logger.exception(f"[アプリ連携] ブックマーク処理に失敗しました: {e}")
+            self._send_response(500, {"status": "error", "message": str(e)})
 
     def _handle_web_progress(self):
         """natsukino.com (HostSource.watchProgress) 用の SSE ストリーム。
@@ -270,6 +353,8 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         if self.server.get_web_job(job_id) is None:
             self._send_response(404, {"status": "error", "message": "Unknown job"})
             return
+
+        self.server.mark_app_contact()
 
         # 注意: ここで Connection: keep-alive ヘッダを送ると BaseHTTPRequestHandler.send_header() が
         # self.close_connection = False を内部設定してしまい、ストリーム終了後は handle() が
@@ -431,6 +516,39 @@ class PixivVaultServer(ThreadingHTTPServer):
         self.web_worker_thread = threading.Thread(target=self._web_queue_worker, daemon=True)
         self.web_worker_thread.start()
 
+        # natsukino.com/iOS版が最後にこの要塞へ接続してきた時刻。GUI側のインジケータ表示・
+        # 「アプリと接続しました」ログの重複抑制(直近60秒以内の再接続はログを出さない)に使う。
+        self._last_app_contact_at = None
+        self._app_contact_lock = threading.Lock()
+
+    def mark_app_contact(self):
+        """natsukino.com/iOS版からの認証済みアクセスを検知するたびに呼ぶ。
+        直近60秒以内に既に検知済みなら「新規接続」とはみなさずログは出さないが、
+        GUIインジケータ用のタイムスタンプは毎回更新する。"""
+        now = time.time()
+        with self._app_contact_lock:
+            previous = self._last_app_contact_at
+            self._last_app_contact_at = now
+        is_new_connection = previous is None or (now - previous) > 60
+        if is_new_connection:
+            logger.info("[アプリ連携] アプリと接続しました")
+            try:
+                from gui import gui_queue_log_callback
+                if gui_queue_log_callback and gui_queue_log_callback[0]:
+                    gui_queue_log_callback[0]("[アプリ連携] アプリと接続しました", color="#00FF66")
+            except Exception as e:
+                logger.debug(f"GUI通知エラー: {e}")
+        try:
+            from gui import gui_set_app_connected
+            if gui_set_app_connected and gui_set_app_connected[0]:
+                gui_set_app_connected[0](now)
+        except Exception as e:
+            logger.debug(f"GUI通知エラー: {e}")
+
+    def last_app_contact_at(self):
+        with self._app_contact_lock:
+            return self._last_app_contact_at
+
     def enqueue(self, key, task):
         """同一keyが投入済み/処理中でなければキューに追加する。追加した場合Trueを返す。"""
         with self._queued_keys_lock:
@@ -520,7 +638,7 @@ class PixivVaultServer(ThreadingHTTPServer):
             job_id = task['jobId']
             try:
                 self.update_web_job(job_id, state='running', message='開始しました')
-                self._run_web_download_job(job_id, task['kind'], task['id'])
+                self._run_web_download_job(job_id, task['kind'], task['id'], task.get('options'))
                 self.update_web_job(job_id, state='done', message='完了しました')
                 job = self.get_web_job(job_id)
                 if job is not None:
@@ -531,9 +649,10 @@ class PixivVaultServer(ThreadingHTTPServer):
             finally:
                 self.web_download_queue.task_done()
 
-    def _run_web_download_job(self, job_id, kind, target_id):
+    def _run_web_download_job(self, job_id, kind, target_id, options=None):
         # Cookie更新をアプリ再起動なしに反映させるため、都度クライアントを生成する
         client = PixivClient(db=self.db)
+        options = options or {}
 
         def log_cb(msg, color=None):
             logger.debug(f"[natsukino.com連携] {msg}")
@@ -550,12 +669,12 @@ class PixivVaultServer(ThreadingHTTPServer):
             if not work:
                 raise Exception(f'作品ID {target_id} が見つかりませんでした')
             self.update_web_job(job_id, total=1, message=f"{work.get('title', '無題')} を保存中")
-            run_single_work_backup(work_id=target_id, is_novel=is_novel, client=client, db=self.db, log_callback=log_cb)
+            run_single_work_backup(work_id=target_id, is_novel=is_novel, client=client, db=self.db, log_callback=log_cb, options=options)
 
         elif kind == 'author':
             run_backup(
                 user_id=target_id, client=client, db=self.db, target_type='both',
-                log_callback=log_cb, progress_callback=progress_cb, new_only=False
+                log_callback=log_cb, progress_callback=progress_cb, new_only=False, options=options
             )
 
         elif kind == 'bookmarks':
@@ -564,7 +683,7 @@ class PixivVaultServer(ThreadingHTTPServer):
                 raise Exception('ログイン状態を確認できませんでした（cookies.txtをご確認ください）')
             download_bookmarks(
                 db=self.db, client=client, my_user_id=my_user_id, target_type='both', rest_type='show',
-                log_callback=log_cb, progress_callback=progress_cb
+                log_callback=log_cb, progress_callback=progress_cb, options=options
             )
 
         elif kind == 'following':
@@ -582,7 +701,7 @@ class PixivVaultServer(ThreadingHTTPServer):
             run_batch_backup(
                 user_ids=user_ids, client=client, db=self.db, target_type='both',
                 log_callback=log_cb, progress_callback=progress_cb,
-                batch_progress_callback=batch_progress_cb, new_only=False
+                batch_progress_callback=batch_progress_cb, new_only=False, options=options
             )
         else:
             raise Exception(f'不明な target.kind: {kind}')

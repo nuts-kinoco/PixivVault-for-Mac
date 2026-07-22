@@ -1076,6 +1076,77 @@ class PixivClient:
         except Exception as e:
             logger.error(f"フォローに失敗しました: {e}")
             raise Exception(f"フォローAPI呼び出しエラー: {e}")
+
+    def add_illust_bookmark(self, illust_id: str, restrict: int = 0, tags: list = None, comment: str = "") -> bool:
+        """イラスト/マンガ作品を実ブックマークする（`follow_user()`と同じ`bookmark_add.php`土台、
+        `type`/対象IDのキーだけ差し替え）。restrict: 0 = 公開, 1 = 非公開。
+        ⚠️ 実際のpixivアカウントへ書き込む操作。実機（実アカウント）検証は未実施。"""
+        token = self.get_csrf_token()
+        if not token:
+            raise Exception("CSRFトークンを取得できませんでした。")
+
+        url = "https://www.pixiv.net/bookmark_add.php"
+        headers = {
+            'x-csrf-token': token,
+            'origin': 'https://www.pixiv.net',
+            'referer': f'https://www.pixiv.net/artworks/{illust_id}'
+        }
+        data = {
+            'mode': 'add',
+            'type': 'illust',
+            'illust_id': illust_id,
+            'restrict': restrict,
+            'comment': comment,
+            'format': 'json'
+        }
+        for i, tag in enumerate(tags or []):
+            data[f'tags[{i}]'] = tag
+
+        try:
+            res = self.session.post(url, headers=headers, data=data, timeout=10)
+            res.raise_for_status()
+            json_res = res.json()
+            if isinstance(json_res, dict) and json_res.get('error'):
+                raise Exception(json_res.get('message', '不明なエラー'))
+            return True
+        except Exception as e:
+            logger.error(f"イラスト/マンガのブックマークに失敗しました: {e}")
+            raise Exception(f"ブックマークAPI呼び出しエラー: {e}")
+
+    def add_novel_bookmark(self, novel_id: str, restrict: int = 0, tags: list = None, comment: str = "") -> bool:
+        """小説作品を実ブックマークする（`add_illust_bookmark()`の小説版）。
+        ⚠️ 実際のpixivアカウントへ書き込む操作。実機（実アカウント）検証は未実施。"""
+        token = self.get_csrf_token()
+        if not token:
+            raise Exception("CSRFトークンを取得できませんでした。")
+
+        url = "https://www.pixiv.net/bookmark_add.php"
+        headers = {
+            'x-csrf-token': token,
+            'origin': 'https://www.pixiv.net',
+            'referer': f'https://www.pixiv.net/novel/show.php?id={novel_id}'
+        }
+        data = {
+            'mode': 'add',
+            'type': 'novel',
+            'novel_id': novel_id,
+            'restrict': restrict,
+            'comment': comment,
+            'format': 'json'
+        }
+        for i, tag in enumerate(tags or []):
+            data[f'tags[{i}]'] = tag
+
+        try:
+            res = self.session.post(url, headers=headers, data=data, timeout=10)
+            res.raise_for_status()
+            json_res = res.json()
+            if isinstance(json_res, dict) and json_res.get('error'):
+                raise Exception(json_res.get('message', '不明なエラー'))
+            return True
+        except Exception as e:
+            logger.error(f"小説のブックマークに失敗しました: {e}")
+            raise Exception(f"ブックマークAPI呼び出しエラー: {e}")
             
     def download_thumbnail_to_memory(self, url: str) -> bytes:
         """サムネイル画像用。インメモリ＋ローカルディスクの自動キャッシュ付き"""
