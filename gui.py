@@ -232,6 +232,10 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
                 app_connection_icon.color = icon_color
                 app_connection_text.value = label
                 app_connection_text.color = icon_color
+                # サーバースレッドが起動直後にトークンを新規発行した場合、GUI初期化時点では
+                # まだDBに反映されていないことがあるため、10秒ごとのティッカーでも
+                # 表示を最新化する。
+                ios_bridge_label_text.value = _current_ios_bridge_label()
                 page.update()
         except Exception:
             pass
@@ -261,6 +265,34 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
         on_change=_on_web_bridge_toggle_change,
         active_color=ft.Colors.GREEN_400,
         scale=0.8,
+    )
+
+    # 現在の接続トークンをヘッダーへ常時表示する（従来はキューログに一度流れるだけで、
+    # 見返すには「キュー」タブへ移動する必要があった）。iOS側の入力欄にそのまま
+    # コピーできるよう、ラベル自体をタップでクリップボードへコピーできるようにする。
+    def _current_ios_bridge_label():
+        token = db.get_setting('web_api_token', '')
+        return f"iOS連携 ({token})" if token else "iOS連携 (未発行)"
+
+    ios_bridge_label_text = ft.Text(
+        _current_ios_bridge_label(), size=11, color=ft.Colors.ON_SURFACE_VARIANT, selectable=True
+    )
+
+    def _on_regenerate_token_click(e):
+        from server import generate_web_token
+        new_token = generate_web_token()
+        db.set_setting('web_api_token', new_token)
+        with _ui_update_lock:
+            ios_bridge_label_text.value = _current_ios_bridge_label()
+            page.update()
+        msg = f"[アプリ連携] 接続トークンを再発行しました: {new_token}"
+        append_queue_log(msg, color="#00FF66")
+        append_log(f"--- {msg} ---", color="#00FF66")
+
+    regenerate_token_btn = ft.IconButton(
+        icon=ft.Icons.REFRESH, icon_size=14, width=24, height=24,
+        tooltip="接続トークンを再発行する（旧トークンで設定済みのiOS側は再入力が必要になります）",
+        on_click=_on_regenerate_token_click,
     )
 
     def clear_user_id_field(e):
@@ -2356,7 +2388,7 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
                 login_status_text,
                 ft.Row(
                     [app_connection_icon, app_connection_text, web_bridge_toggle,
-                     ft.Text("iOS連携", size=11, color=ft.Colors.ON_SURFACE_VARIANT)],
+                     ios_bridge_label_text, regenerate_token_btn],
                     spacing=6
                 ),
             ]),
