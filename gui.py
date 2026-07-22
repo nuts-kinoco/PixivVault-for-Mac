@@ -209,17 +209,24 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
     app_connection_text = ft.Text("アプリ: 未接続", size=12, color=ft.Colors.ON_SURFACE_VARIANT)
 
     def _refresh_app_connection_label():
-        last = _last_app_contact_holder[0]
-        if last is None:
-            icon_color, label = ft.Colors.ON_SURFACE_VARIANT, "アプリ: 未接続"
+        # トグルOFF中は「最終接続からの経過時間」に関係なく、常に「無効」表示を優先する。
+        # OFFにした直後でも直近60秒以内の接続履歴が残っていると「接続中」のまま見えて
+        # しまう（トグルは新規接続を拒否するだけで過去の接続履歴は消さない仕様）ため、
+        # トグル操作に応じて即座に切り替わるようにする。
+        if db.get_setting('web_bridge_enabled', '1') != '1':
+            icon_color, label = ft.Colors.RED_400, "アプリ連携: 無効（手動でOFF）"
         else:
-            elapsed = time.time() - last
-            if elapsed < 60:
-                icon_color, label = ft.Colors.GREEN_400, "アプリ: 接続中"
+            last = _last_app_contact_holder[0]
+            if last is None:
+                icon_color, label = ft.Colors.ON_SURFACE_VARIANT, "アプリ: 未接続"
             else:
-                mins = int(elapsed // 60)
-                icon_color = ft.Colors.ON_SURFACE_VARIANT
-                label = f"アプリ: 未接続（最終接続 {mins}分前）" if mins > 0 else "アプリ: 未接続（最終接続 1分未満前）"
+                elapsed = time.time() - last
+                if elapsed < 60:
+                    icon_color, label = ft.Colors.GREEN_400, "アプリ: 接続中"
+                else:
+                    mins = int(elapsed // 60)
+                    icon_color = ft.Colors.ON_SURFACE_VARIANT
+                    label = f"アプリ: 未接続（最終接続 {mins}分前）" if mins > 0 else "アプリ: 未接続（最終接続 1分未満前）"
         try:
             with _ui_update_lock:
                 app_connection_icon.color = icon_color
@@ -247,6 +254,7 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
     # 実機テスト時に「アプリ未接続」状態を意図的に作れるようにするためのもの。
     def _on_web_bridge_toggle_change(e):
         db.set_setting('web_bridge_enabled', '1' if e.control.value else '0')
+        _refresh_app_connection_label()
 
     web_bridge_toggle = ft.Switch(
         value=db.get_setting('web_bridge_enabled', '1') == '1',
