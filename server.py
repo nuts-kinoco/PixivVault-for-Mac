@@ -101,6 +101,16 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _check_web_bridge_enabled(self):
+        """GUIのトグルでnatsukino.com/iOS版連携が一時的に無効化されていないか確認する。
+        拡張機能連携（_is_allowed_extension_origin側）には一切影響しない、web-origin系
+        エンドポイント専用のガード。テスト時に「アプリ未接続」状態を意図的に作れるように、
+        サーバー自体を落とさずに接続受け付けだけを止められるようにするためのもの。"""
+        if not self.server.is_web_bridge_enabled():
+            self._send_response(503, {"status": "error", "message": "PC要塞側でこの連携が一時的に無効になっています"})
+            return False
+        return True
+
     def do_GET(self):
         # /ping と /progress/<jobId> は拡張機能・natsukino.com 双方からアクセスされうるため
         # 従来の拡張機能限定 _check_origin() より先に、それぞれ専用の判定へ振り分ける。
@@ -183,6 +193,8 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         # 拡張機能origin一致は「アプリ接続」とはみなさない（ブラウザ拡張とiOS/natsukino.comの
         # 接続インジケータを混同しないため、web-origin側にマッチした場合のみ記録する）。
         if self._is_allowed_web_origin(origin):
+            if not self._check_web_bridge_enabled():
+                return
             self.server.mark_app_contact()
         self._send_response(200, {"status": "ok"})
 
@@ -233,6 +245,8 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
     def _handle_web_download(self):
         """natsukino.com (HostSource.enqueueDownload) 用プロトコル。DownloadCommand 形式の JSON を受け取り、
         既存の core.py バックアップ機構にマッピングしてジョブとしてキューへ積む。トークン必須。"""
+        if not self._check_web_bridge_enabled():
+            return
         if not self._check_web_token():
             return
         self.server.mark_app_contact()
@@ -290,6 +304,8 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         `add_illust_bookmark`/`add_novel_bookmark`へ委譲する。
         ⚠️ 実際にユーザーのpixivアカウントへ書き込む操作のため、まだ実機（実アカウント）検証は
         行っていない（`DirectPixivSource.addBookmark`と同様、本番投入前に必ず実機検証すること）。"""
+        if not self._check_web_bridge_enabled():
+            return
         if not self._check_web_token():
             return
         self.server.mark_app_contact()
@@ -340,6 +356,8 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         origin = self.headers.get('Origin', '')
         if not self._is_allowed_web_origin(origin):
             self._send_response(403, {"status": "error", "message": "Forbidden"})
+            return
+        if not self._check_web_bridge_enabled():
             return
 
         parsed = urllib.parse.urlsplit(self.path)
@@ -575,6 +593,15 @@ class PixivVaultServer(ThreadingHTTPServer):
                 self.download_queue.task_done()
 
     # ── natsukino.com (要塞ホストモード) ─────────────────────────────────
+
+    def is_web_bridge_enabled(self):
+        """GUIのトグルでnatsukino.com/iOS版連携の接続受け付けを一時停止できるようにするための
+        フラグ。DB設定 'web_bridge_enabled'（既定 '1'=有効）。サーバー自体は落とさず、
+        テスト時に意図的な「未接続」状態を作れるようにする（拡張機能連携には影響しない）。"""
+        return self.db.get_setting('web_bridge_enabled', '1') == '1'
+
+    def set_web_bridge_enabled(self, enabled: bool):
+        self.db.set_setting('web_bridge_enabled', '1' if enabled else '0')
 
     def get_web_allowed_origins(self):
         """natsukino.com 側からの Origin 許可リスト。DB設定 'web_allowed_origins' (JSON配列文字列)

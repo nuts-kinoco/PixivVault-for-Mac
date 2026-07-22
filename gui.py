@@ -242,6 +242,19 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
 
     threading.Thread(target=_app_connection_ticker, daemon=True).start()
 
+    # サーバー自体は落とさず、natsukino.com/iOS版からの接続受け付けだけをGUIから
+    # 手動でON/OFFできるようにするトグル（拡張機能連携には影響しない）。
+    # 実機テスト時に「アプリ未接続」状態を意図的に作れるようにするためのもの。
+    def _on_web_bridge_toggle_change(e):
+        db.set_setting('web_bridge_enabled', '1' if e.control.value else '0')
+
+    web_bridge_toggle = ft.Switch(
+        value=db.get_setting('web_bridge_enabled', '1') == '1',
+        on_change=_on_web_bridge_toggle_change,
+        active_color=ft.Colors.GREEN_400,
+        scale=0.8,
+    )
+
     def clear_user_id_field(e):
         with _ui_update_lock:
             user_id_field.value = ""
@@ -2333,7 +2346,11 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
                     ft.Text("PixivVault", size=32, weight=ft.FontWeight.BOLD),
                 ]),
                 login_status_text,
-                ft.Row([app_connection_icon, app_connection_text], spacing=6),
+                ft.Row(
+                    [app_connection_icon, app_connection_text, web_bridge_toggle,
+                     ft.Text("iOS/natsukino.com連携", size=11, color=ft.Colors.ON_SURFACE_VARIANT)],
+                    spacing=6
+                ),
             ]),
             ft.Row([history_btn, open_folder_btn, theme_toggle_btn, cookie_picker_btn, settings_btn], spacing=5)
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
