@@ -551,9 +551,11 @@ class PixivVaultServer(ThreadingHTTPServer):
         if is_new_connection:
             logger.info("[アプリ連携] アプリと接続しました")
             try:
-                from gui import gui_queue_log_callback
+                from gui import gui_queue_log_callback, gui_log_callback
                 if gui_queue_log_callback and gui_queue_log_callback[0]:
                     gui_queue_log_callback[0]("[アプリ連携] アプリと接続しました", color="#00FF66")
+                if gui_log_callback and gui_log_callback[0]:
+                    gui_log_callback[0]("--- [アプリ連携] アプリと接続しました ---", color="#00FF66")
             except Exception as e:
                 logger.debug(f"GUI通知エラー: {e}")
         try:
