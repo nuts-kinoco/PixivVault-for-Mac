@@ -287,17 +287,23 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         if raw_options.get('novelFormat') in ('epub', 'txt', 'both'):
             options['novel_format'] = raw_options['novelFormat']
 
+        # 差分DL（Step 5）: 既にダウンロード済みの作品をスキップし、新規のみ取得する。
+        # 判定はホスト側の正典DB（core.py の new_only ロジック）に委譲する。
+        # work 種別のときは「その作品の作者の新規作品のみ」という意味になる（作者は要塞側で解決）。
+        new_only = bool(data.get('newOnly', False))
+
         job_id = uuid.uuid4().hex
-        logger.info(f"[アプリ連携] ダウンロード命令を受信しました: kind={kind} id={target_id} options={options}")
+        logger.info(f"[アプリ連携] ダウンロード命令を受信しました: kind={kind} id={target_id} new_only={new_only} options={options}")
         try:
             from gui import gui_queue_log_callback
             if gui_queue_log_callback and gui_queue_log_callback[0]:
-                gui_queue_log_callback[0](f"[アプリ連携] ダウンロード命令を受信: {kind} (id={target_id})", color="#00FF66")
+                label = "差分DL" if new_only else "DL"
+                gui_queue_log_callback[0](f"[アプリ連携] {label}命令を受信: {kind} (id={target_id})", color="#00FF66")
         except Exception as e:
             logger.debug(f"GUI通知エラー: {e}")
 
         self.server.register_web_job(job_id, kind, target_id)
-        self.server.web_download_queue.put({'jobId': job_id, 'kind': kind, 'id': target_id, 'options': options})
+        self.server.web_download_queue.put({'jobId': job_id, 'kind': kind, 'id': target_id, 'options': options, 'new_only': new_only})
         self._send_response(200, {"jobId": job_id})
 
     def _handle_bookmark(self):
@@ -650,7 +656,7 @@ class PixivVaultServer(ThreadingHTTPServer):
             target_id = task['id']
             try:
                 self.update_web_job(job_id, state='running', message='開始しました')
-                self._run_web_download_job(job_id, kind, target_id, task.get('options'))
+                self._run_web_download_job(job_id, kind, target_id, task.get('options'), task.get('new_only', False))
                 self.update_web_job(job_id, state='done', message='完了しました')
                 job = self.get_web_job(job_id)
                 if job is not None:
@@ -686,7 +692,7 @@ class PixivVaultServer(ThreadingHTTPServer):
         except Exception as e:
             logger.debug(f"GUI通知エラー: {e}")
 
-    def _run_web_download_job(self, job_id, kind, target_id, options=None):
+    def _run_web_download_job(self, job_id, kind, target_id, options=None, new_only=False):
         # Cookie更新をアプリ再起動なしに反映させるため、都度クライアントを生成する
         client = PixivClient(db=self.db)
         options = options or {}
@@ -698,20 +704,36 @@ class PixivVaultServer(ThreadingHTTPServer):
             self.update_web_job(job_id, done=idx, total=total, message=f'{idx}/{total} 件処理中')
 
         if kind == 'work':
-            work = client.get_work_info(target_id)
-            is_novel = False
-            if not work:
-                work = client.get_novel_info(target_id)
-                is_novel = True
-            if not work:
-                raise Exception(f'作品ID {target_id} が見つかりませんでした')
-            self.update_web_job(job_id, total=1, message=f"{work.get('title', '無題')} を保存中")
-            run_single_work_backup(work_id=target_id, is_novel=is_novel, client=client, db=self.db, log_callback=log_cb, options=options)
+            if new_only:
+                # 差分DL: この作品の「作者」を要塞側で解決し、その作者の新規作品のみ取得する
+                # （拡張は作品IDしか持たないため作者解決はここで行う。PC版拡張の「差分DL」＝
+                # 作者単位new_onlyと同じ意味論）。
+                work = client.get_work_info(target_id) or client.get_novel_info(target_id)
+                if not work:
+                    raise Exception(f'作品ID {target_id} が見つかりませんでした')
+                author_id = work.get('user_id')
+                if not author_id:
+                    raise Exception(f'作品ID {target_id} の作者を特定できませんでした')
+                self.update_web_job(job_id, message=f"作者 {work.get('user_name', author_id)} の新規作品を確認中")
+                run_backup(
+                    user_id=str(author_id), client=client, db=self.db, target_type='both',
+                    log_callback=log_cb, progress_callback=progress_cb, new_only=True, options=options
+                )
+            else:
+                work = client.get_work_info(target_id)
+                is_novel = False
+                if not work:
+                    work = client.get_novel_info(target_id)
+                    is_novel = True
+                if not work:
+                    raise Exception(f'作品ID {target_id} が見つかりませんでした')
+                self.update_web_job(job_id, total=1, message=f"{work.get('title', '無題')} を保存中")
+                run_single_work_backup(work_id=target_id, is_novel=is_novel, client=client, db=self.db, log_callback=log_cb, options=options)
 
         elif kind == 'author':
             run_backup(
                 user_id=target_id, client=client, db=self.db, target_type='both',
-                log_callback=log_cb, progress_callback=progress_cb, new_only=False, options=options
+                log_callback=log_cb, progress_callback=progress_cb, new_only=new_only, options=options
             )
 
         elif kind == 'bookmarks':
@@ -738,7 +760,7 @@ class PixivVaultServer(ThreadingHTTPServer):
             run_batch_backup(
                 user_ids=user_ids, client=client, db=self.db, target_type='both',
                 log_callback=log_cb, progress_callback=progress_cb,
-                batch_progress_callback=batch_progress_cb, new_only=False, options=options
+                batch_progress_callback=batch_progress_cb, new_only=new_only, options=options
             )
         else:
             raise Exception(f'不明な target.kind: {kind}')
