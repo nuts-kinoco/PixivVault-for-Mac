@@ -27,6 +27,25 @@ ALLOWED_ORIGIN_PREFIX = 'chrome-extension://'
 # トークンは PixivVaultServer.get_web_token() が初回アクセス時に自動生成しDBへ保存する。
 WEB_TOKEN_HEADER = 'X-PixivVault-Token'
 
+# 稼働中の PixivVaultServer インスタンス（start_server が設定する）。GUI側が
+# 「最終アプリ接続時刻」のようなサーバー側の正典状態をプル参照するための窓口。
+# push通知(gui_set_app_connected)だけに頼ると、main.py起動直後＝GUIコールバック登録前に
+# iOS側が自動接続してきた場合に通知が黙って落ち、以後インジケータが「未接続」のまま
+# 固まる（教訓17と同型の競合の第2事例、2026-07-24にWindows実機で確認）。
+_running_server = [None]
+
+
+def get_last_app_contact():
+    """iOS版が最後に接続してきた時刻(time.time())。サーバー未起動/未接続なら None。
+    GUIの接続インジケータのティッカーが毎回この正典値をプル参照する。"""
+    srv = _running_server[0]
+    if srv is None:
+        return None
+    try:
+        return srv.last_app_contact_at()
+    except Exception:
+        return None
+
 # 手入力しやすいよう、視認性の低い文字(0/O/1/I/L)を除いた英数字にした（LAN内限定・
 # 家庭用ルーターのNAT背後という前提での利便性優先のトレードオフ）。8桁でも
 # 31^8 ≒ 8500億通りあり、HTTPリクエスト経由の総当たりは現実的な時間では終わらない。
@@ -1081,6 +1100,7 @@ def start_server(port, db, client):
     # 側でループバック接続元のみへ引き続き限定しているため、LAN上の他端末からは到達不可のまま。
     server_address = ('0.0.0.0', port)
     httpd = PixivVaultServer(server_address, PixivVaultRequestHandler, db, client)
+    _running_server[0] = httpd
     logger.info(f"拡張機能連携サーバーを 0.0.0.0:{port} (LAN含む全インターフェース) で起動しました。")
     token = httpd.get_web_token()
     logger.info(f"[アプリ連携] 接続トークン: {token}")

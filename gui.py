@@ -218,6 +218,18 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
                 icon_color, label = ft.Colors.RED_400, "アプリ: 切断中"
             else:
                 last = _last_app_contact_holder[0]
+                # push通知(gui_set_app_connected)はGUIコールバック登録前の接続を取りこぼす
+                # （main.py起動直後にiOS側が自動接続するケース。教訓17と同型の競合）ため、
+                # サーバー側の正典タイムスタンプも毎回プル参照して新しい方を採用する。
+                # これでティッカー(10秒毎)が最大10秒遅れで必ず表示を回復する。
+                try:
+                    from server import get_last_app_contact
+                    server_last = get_last_app_contact()
+                    if server_last is not None and (last is None or server_last > last):
+                        last = server_last
+                        _last_app_contact_holder[0] = last
+                except Exception:
+                    pass
                 if last is None:
                     icon_color, label = ft.Colors.ON_SURFACE_VARIANT, "アプリ: 未接続"
                 else:
