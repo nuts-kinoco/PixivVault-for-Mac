@@ -213,30 +213,44 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
         # OFFにした直後でも直近60秒以内の接続履歴が残っていると「接続中」のまま見えて
         # しまう（トグルは新規接続を拒否するだけで過去の接続履歴は消さない仕様）ため、
         # トグル操作に応じて即座に切り替わるようにする。
-        if db.get_setting('web_bridge_enabled', '1') != '1':
-            icon_color, label = ft.Colors.RED_400, "アプリ: 切断中"
-        else:
-            last = _last_app_contact_holder[0]
-            if last is None:
-                icon_color, label = ft.Colors.ON_SURFACE_VARIANT, "アプリ: 未接続"
-            else:
-                elapsed = time.time() - last
-                if elapsed < 60:
-                    icon_color, label = ft.Colors.GREEN_400, "アプリ: 接続中"
-                else:
-                    mins = int(elapsed // 60)
-                    icon_color = ft.Colors.ON_SURFACE_VARIANT
-                    label = f"アプリ: 未接続（最終接続 {mins}分前）" if mins > 0 else "アプリ: 未接続（最終接続 1分未満前）"
         try:
-            with _ui_update_lock:
-                app_connection_icon.color = icon_color
-                app_connection_text.value = label
-                app_connection_text.color = icon_color
-                # サーバースレッドが起動直後にトークンを新規発行した場合、GUI初期化時点では
-                # まだDBに反映されていないことがあるため、10秒ごとのティッカーでも
-                # 表示を最新化する。
-                ios_bridge_label_text.value = _current_ios_bridge_label()
-                page.update()
+            if db.get_setting('web_bridge_enabled', '1') != '1':
+                icon_color, label = ft.Colors.RED_400, "アプリ: 切断中"
+            else:
+                last = _last_app_contact_holder[0]
+                if last is None:
+                    icon_color, label = ft.Colors.ON_SURFACE_VARIANT, "アプリ: 未接続"
+                else:
+                    elapsed = time.time() - last
+                    if elapsed < 60:
+                        icon_color, label = ft.Colors.GREEN_400, "アプリ: 接続中"
+                    else:
+                        mins = int(elapsed // 60)
+                        icon_color = ft.Colors.ON_SURFACE_VARIANT
+                        label = f"アプリ: 未接続（最終接続 {mins}分前）" if mins > 0 else "アプリ: 未接続（最終接続 1分未満前）"
+            # サーバースレッドが起動直後にトークンを新規発行した場合、GUI初期化時点では
+            # まだDBに反映されていないことがあるため、ティッカーでも表示を最新化する。
+            bridge_label = _current_ios_bridge_label()
+
+            def _apply_app_connection_label():
+                with _ui_update_lock:
+                    app_connection_icon.color = icon_color
+                    app_connection_text.value = label
+                    app_connection_text.color = icon_color
+                    ios_bridge_label_text.value = bridge_label
+                    page.update()
+
+            # Windows実機で、サーバースレッド/ティッカースレッドからの page.update() が
+            # 例外にもならず画面に反映されない（トグル等のUIスレッド操作で初めてフラッシュ
+            # される）事象が確認された。_ui_update_lock は並行更新の競合を防ぐだけで
+            # 「非UIスレッドからの更新の配信」は保証しないため、FletのUIイベントループへ
+            # run_task で正式にマーシャリングする（失敗時は従来どおり直接適用）。
+            async def _apply_async():
+                _apply_app_connection_label()
+            try:
+                page.run_task(_apply_async)
+            except Exception:
+                _apply_app_connection_label()
         except Exception:
             pass
 
@@ -249,7 +263,12 @@ def main_window(page: ft.Page, db: Database = None, scheduler=None):
     def _app_connection_ticker():
         while True:
             time.sleep(10)
-            _refresh_app_connection_label()
+            # 例外でティッカースレッドが死ぬと以後の減衰表示が止まるため、握りつぶして継続する
+            # （_refresh_app_connection_label 自身も防御しているが二重に保険を掛ける）。
+            try:
+                _refresh_app_connection_label()
+            except Exception:
+                pass
 
     threading.Thread(target=_app_connection_ticker, daemon=True).start()
 
