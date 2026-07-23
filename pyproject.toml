@@ -1,0 +1,30 @@
+[project]
+name = "PixivVault"
+
+[tool.flet]
+product = "PixivVault"
+org = "com.pixivvault"
+bundle_id = "com.pixivvault.app"
+company = "PixivVault"
+
+[tool.flet.app]
+# .gitignoreの「PixivVault User Data (DO NOT UPLOAD)」節と同じ対象を、配布ビルドの
+# app.zipにも絶対に含めないようにする。flet buildは.gitignoreを見ないため、
+# ここで明示的に除外しないとユーザーの実データベース・Cookieがそのまま同梱されてしまう。
+exclude = [
+    ".git",
+    ".venv",
+    "build",
+    "dist",
+    "cache",
+    "Images",
+    "pixiv_vault.db",
+    "pixiv_vault.db-shm",
+    "pixiv_vault.db-wal",
+    "cookies.txt",
+    "gui_error_log.txt",
+    "failed_queue_export.csv",
+    ".pytest_cache",
+    ".DS_Store",
+    "prompt.txt",
+]
