@@ -123,6 +123,11 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         if self.path.startswith('/progress/'):
             self._handle_web_progress()
             return
+        # リモートzipビューア（Step 6, 7.5）: iOS版専用。トークン認証・save_path配下限定。
+        # 拡張機能限定の _check_origin() より前で振り分ける（iOSのURLSessionはOriginを送らない）。
+        if self.path.startswith('/library/'):
+            self._handle_library_get()
+            return
         if not self._check_origin():
             return
         if self.path.startswith('/api/work/'):
@@ -153,6 +158,208 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
                 self._send_response(400, {"status": "error", "message": "Invalid path"})
         else:
             self._send_response(404, {"status": "error", "message": "Not found"})
+
+    # ===== リモートzipビューア（Step 6, 7.5）=====
+
+    # 一覧のページング既定/上限（25TB規模でも一度に返しすぎないように）。
+    LIBRARY_DEFAULT_LIMIT = 200
+    LIBRARY_MAX_LIMIT = 1000
+    # サムネイル長辺（px）。
+    LIBRARY_THUMB_MAX = 480
+    IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp')
+
+    def _handle_library_get(self):
+        """/library/* のディスパッチ。トークン認証必須・save_path配下限定。"""
+        if not self._check_web_bridge_enabled():
+            return
+        if not self._check_web_token():
+            return
+        self.server.mark_app_contact()
+
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == '/library/list':
+            self._handle_library_list(query)
+        elif parsed.path == '/library/image':
+            self._handle_library_image(query)
+        else:
+            self._send_response(404, {"status": "error", "message": "Not found"})
+
+    def _library_root(self):
+        import os
+        save_path = self.server.db.get_setting("save_path", "Images")
+        return os.path.realpath(os.path.abspath(save_path))
+
+    def _safe_join(self, root, relpath):
+        """`root` 配下に収まる絶対パスへ解決する。範囲外・トラバーサルは None。"""
+        import os
+        relpath = (relpath or "").strip().lstrip('/\\')
+        candidate = os.path.realpath(os.path.abspath(os.path.join(root, relpath)))
+        if candidate == root or candidate.startswith(root + os.sep):
+            return candidate
+        return None
+
+    @staticmethod
+    def _query1(query, key, default=None):
+        vals = query.get(key)
+        return vals[0] if vals else default
+
+    def _paginate(self, query, items):
+        try:
+            offset = max(0, int(self._query1(query, 'offset', '0')))
+        except ValueError:
+            offset = 0
+        try:
+            limit = int(self._query1(query, 'limit', str(self.LIBRARY_DEFAULT_LIMIT)))
+        except ValueError:
+            limit = self.LIBRARY_DEFAULT_LIMIT
+        limit = max(1, min(limit, self.LIBRARY_MAX_LIMIT))
+        total = len(items)
+        return items[offset:offset + limit], total, offset, limit
+
+    def _handle_library_list(self, query):
+        import os, zipfile
+        root = self._library_root()
+        relpath = self._query1(query, 'path', '')
+        target = self._safe_join(root, relpath)
+        if target is None:
+            self._send_response(400, {"status": "error", "message": "Invalid path"})
+            return
+        if not os.path.exists(target):
+            self._send_response(404, {"status": "error", "message": "保存フォルダが見つかりません"})
+            return
+
+        # zip の中身を一覧する
+        if os.path.isfile(target) and target.lower().endswith('.zip'):
+            try:
+                with zipfile.ZipFile(target, 'r') as zf:
+                    infos = [i for i in zf.infolist() if not i.is_dir()]
+            except zipfile.BadZipFile:
+                self._send_response(422, {"status": "error", "message": "壊れたZIP、または追記中です"})
+                return
+            except (OSError, PermissionError):
+                # 追記ロック中などの一過性の読み取り失敗。クライアントは再試行してよい。
+                self._send_response(423, {"status": "error", "message": "ZIPが使用中です。少し後に再試行してください"})
+                return
+            entries = [{"name": i.filename, "kind": "zipentry", "size": i.file_size} for i in infos]
+            entries.sort(key=lambda e: e["name"])
+            page, total, offset, limit = self._paginate(query, entries)
+            self._send_response(200, {"path": relpath, "container": "zip", "entries": page,
+                                      "total": total, "offset": offset, "limit": limit})
+            return
+
+        # ディレクトリの中身を一覧する
+        if os.path.isdir(target):
+            entries = []
+            try:
+                with os.scandir(target) as it:
+                    for e in it:
+                        name = e.name
+                        if name.startswith('.'):
+                            continue
+                        rel = (relpath.rstrip('/') + '/' + name) if relpath else name
+                        try:
+                            size = e.stat().st_size if e.is_file() else 0
+                        except OSError:
+                            size = 0
+                        if e.is_dir():
+                            kind = "folder"
+                        elif name.lower().endswith('.zip'):
+                            kind = "zip"
+                        elif name.lower().endswith(self.IMAGE_EXTS):
+                            kind = "image"
+                        else:
+                            kind = "file"
+                        entries.append({"name": name, "kind": kind, "path": rel, "size": size})
+            except OSError as e:
+                self._send_response(500, {"status": "error", "message": f"読み取りに失敗しました: {e}"})
+                return
+            # フォルダ→zip→画像→その他 の順、各グループ内は名前順。
+            order = {"folder": 0, "zip": 1, "image": 2, "file": 3}
+            entries.sort(key=lambda x: (order.get(x["kind"], 9), x["name"].lower()))
+            page, total, offset, limit = self._paginate(query, entries)
+            self._send_response(200, {"path": relpath, "container": "dir", "entries": page,
+                                      "total": total, "offset": offset, "limit": limit})
+            return
+
+        self._send_response(400, {"status": "error", "message": "一覧できない対象です"})
+
+    def _handle_library_image(self, query):
+        import os, zipfile
+        root = self._library_root()
+        relpath = self._query1(query, 'path', '')
+        entry = self._query1(query, 'entry', None)
+        thumb = self._query1(query, 'thumb', '0') in ('1', 'true', 'yes')
+
+        target = self._safe_join(root, relpath)
+        if target is None or not os.path.exists(target):
+            self._send_response(404, {"status": "error", "message": "見つかりません"})
+            return
+
+        data = None
+        name_for_ext = None
+        try:
+            if os.path.isfile(target) and target.lower().endswith('.zip'):
+                if not entry or '..' in entry.replace('\\', '/').split('/'):
+                    self._send_response(400, {"status": "error", "message": "Invalid entry"})
+                    return
+                with zipfile.ZipFile(target, 'r') as zf:
+                    data = zf.read(entry)
+                name_for_ext = entry
+            elif os.path.isfile(target):
+                with open(target, 'rb') as f:
+                    data = f.read()
+                name_for_ext = target
+            else:
+                self._send_response(400, {"status": "error", "message": "画像ではありません"})
+                return
+        except KeyError:
+            self._send_response(404, {"status": "error", "message": "ZIP内に該当エントリがありません"})
+            return
+        except zipfile.BadZipFile:
+            self._send_response(422, {"status": "error", "message": "壊れたZIP、または追記中です"})
+            return
+        except (OSError, PermissionError):
+            self._send_response(423, {"status": "error", "message": "ファイルが使用中です。再試行してください"})
+            return
+
+        if thumb:
+            data = self._make_thumbnail(data) or data
+
+        self._send_bytes(200, data, self._content_type_for(name_for_ext))
+
+    def _make_thumbnail(self, data):
+        """Pillowでサムネイル化（長辺 LIBRARY_THUMB_MAX）。失敗/未導入時は None（原本を返す）。"""
+        try:
+            import io
+            from PIL import Image
+            img = Image.open(io.BytesIO(data))
+            img.thumbnail((self.LIBRARY_THUMB_MAX, self.LIBRARY_THUMB_MAX))
+            buf = io.BytesIO()
+            fmt = 'PNG' if (img.mode in ('RGBA', 'P') and img.format == 'PNG') else 'JPEG'
+            if fmt == 'JPEG' and img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            img.save(buf, format=fmt)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _content_type_for(name):
+        import os
+        ext = os.path.splitext(name or '')[1].lower()
+        return {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+            '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+        }.get(ext, 'application/octet-stream')
+
+    def _send_bytes(self, status_code, data, content_type):
+        self.send_response(status_code)
+        self._send_cors_headers(self.headers.get('Origin', ''))
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         # /download は拡張機能(既存プロトコル)とiOS版(新プロトコル) の両方が叩くため、
