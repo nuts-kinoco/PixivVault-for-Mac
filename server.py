@@ -142,6 +142,10 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         if self.path.startswith('/progress/'):
             self._handle_web_progress()
             return
+        # 7.7 ジョブリモコン: iOS版のジョブ一覧（トークン認証・ヘッダ）。
+        if self.path == '/jobs' or self.path.startswith('/jobs?'):
+            self._handle_jobs_list()
+            return
         # リモートzipビューア（Step 6, 7.5）: iOS版専用。トークン認証・save_path配下限定。
         # 拡張機能限定の _check_origin() より前で振り分ける（iOSのURLSessionはOriginを送らない）。
         if self.path.startswith('/library/'):
@@ -391,6 +395,10 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         if self.path == '/bookmark':
             self._handle_bookmark()
             return
+        # 7.7 ジョブリモコン: /jobs/<id>/pause|resume|stop（iOS版専用・トークン認証）。
+        if self.path.startswith('/jobs/'):
+            self._handle_job_control()
+            return
         if not self._check_origin():
             return
         if self.path == '/api/cookie/sync':
@@ -528,7 +536,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             logger.debug(f"GUI通知エラー: {e}")
 
-        self.server.register_web_job(job_id, kind, target_id)
+        self.server.register_web_job(job_id, kind, target_id, new_only=new_only)
         self.server.web_download_queue.put({'jobId': job_id, 'kind': kind, 'id': target_id, 'options': options, 'new_only': new_only})
         self._send_response(200, {"jobId": job_id})
 
@@ -585,6 +593,51 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
             logger.exception(f"[アプリ連携] ブックマーク処理に失敗しました: {e}")
             self._send_response(500, {"status": "error", "message": str(e)})
 
+    def _handle_jobs_list(self):
+        """7.7: iOS版のジョブ一覧。トークン認証（ヘッダ）。実行中・待機中・直近の終了ジョブを返す。"""
+        if not self._check_web_bridge_enabled():
+            return
+        if not self._check_web_token():
+            return
+        self.server.mark_app_contact()
+        self._send_response(200, {"jobs": self.server.list_web_jobs()})
+
+    def _handle_job_control(self):
+        """7.7: /jobs/<id>/pause|resume|stop。トークン認証（ヘッダ）。"""
+        if not self._check_web_bridge_enabled():
+            return
+        if not self._check_web_token():
+            return
+        # 本体（あれば）を読み捨ててソケットを綺麗に保つ。制御はパスのみで表す。
+        content_length = int(self.headers.get('Content-Length', 0) or 0)
+        if content_length > 0:
+            self.rfile.read(content_length)
+        self.server.mark_app_contact()
+
+        parts = urllib.parse.urlsplit(self.path).path.strip('/').split('/')
+        if len(parts) != 3 or parts[0] != 'jobs':
+            self._send_response(400, {"status": "error", "message": "Invalid path"})
+            return
+        _, job_id, action = parts
+        if self.server.get_web_job(job_id) is None:
+            self._send_response(404, {"status": "error", "message": "Unknown job"})
+            return
+
+        if action == 'pause':
+            ok = self.server.pause_web_job(job_id)
+        elif action == 'resume':
+            ok = self.server.resume_web_job(job_id)
+        elif action == 'stop':
+            ok = self.server.stop_web_job(job_id)
+        else:
+            self._send_response(400, {"status": "error", "message": "Invalid action"})
+            return
+
+        if ok:
+            self._send_response(200, {"status": "ok", "job": self.server.get_web_job(job_id)})
+        else:
+            self._send_response(409, {"status": "error", "message": "現在の状態では実行できない操作です"})
+
     def _handle_web_progress(self):
         """iOS版 (HostSource.watchProgress) 用の SSE ストリーム。
         EventSource はカスタムヘッダを送れないため、トークンはクエリパラメータで受け取る。"""
@@ -632,7 +685,7 @@ class PixivVaultRequestHandler(BaseHTTPRequestHandler):
                     self.wfile.write(f"data: {snapshot}\n\n".encode('utf-8'))
                     self.wfile.flush()
                     last_sent = snapshot
-                if job['state'] in ('done', 'error'):
+                if job['state'] in ('done', 'error', 'stopped'):
                     break
                 time.sleep(0.5)
         except (BrokenPipeError, ConnectionResetError):
@@ -765,6 +818,9 @@ class PixivVaultServer(ThreadingHTTPServer):
         # リクエストごとに一意な jobId を発行し、進捗を web_jobs で追跡する (SSE配信用)。
         self.web_download_queue = queue.Queue()
         self.web_jobs = {}
+        # 7.7 ジョブリモコン: ジョブ別の stop/pause イベント。web_jobs はそのまま JSON 化して
+        # /progress・/jobs で配信するため、JSON 非対応の threading.Event はこちらに分離して持つ。
+        self.web_job_events = {}
         self._web_jobs_lock = threading.Lock()
         self.web_worker_thread = threading.Thread(target=self._web_queue_worker, daemon=True)
         self.web_worker_thread.start()
@@ -853,26 +909,87 @@ class PixivVaultServer(ThreadingHTTPServer):
             logger.info(f"[アプリ連携] Web接続トークンを新規発行しました: {token}")
         return token
 
-    def register_web_job(self, job_id, kind, target_id):
+    # 7.7: 過去ジョブの上限（超過分は古い終了済みジョブから捨てる。/jobs 一覧の肥大防止）。
+    WEB_JOBS_MAX = 50
+
+    def register_web_job(self, job_id, kind, target_id, new_only=False):
         with self._web_jobs_lock:
+            # 上限超過なら、古い「終了済み」ジョブから間引く（実行中/待機中は残す）。
+            if len(self.web_jobs) >= self.WEB_JOBS_MAX:
+                finished = [jid for jid, j in self.web_jobs.items()
+                            if j.get('state') in ('done', 'error', 'stopped')]
+                for jid in finished[:max(1, len(self.web_jobs) - self.WEB_JOBS_MAX + 1)]:
+                    self.web_jobs.pop(jid, None)
+                    self.web_job_events.pop(jid, None)
             self.web_jobs[job_id] = {
                 'jobId': job_id,
+                'kind': kind,
+                'id': target_id,
+                'newOnly': bool(new_only),
                 'done': 0,
                 'total': 1,
                 'state': 'queued',
+                'etaSeconds': None,
                 'message': f'{kind} のダウンロードを待機中です'
             }
+            self.web_job_events[job_id] = {'stop': threading.Event(), 'pause': threading.Event()}
 
     def get_web_job(self, job_id):
         with self._web_jobs_lock:
             job = self.web_jobs.get(job_id)
             return dict(job) if job is not None else None
 
+    def list_web_jobs(self):
+        """7.7: iOS のジョブ一覧（GET /jobs）用。新しい順に返す。"""
+        with self._web_jobs_lock:
+            return [dict(j) for j in reversed(list(self.web_jobs.values()))]
+
     def update_web_job(self, job_id, **fields):
         with self._web_jobs_lock:
             job = self.web_jobs.get(job_id)
             if job is not None:
                 job.update(fields)
+
+    # ===== 7.7 ジョブリモコン: 一時停止 / 再開 / 停止 =====
+
+    def pause_web_job(self, job_id):
+        with self._web_jobs_lock:
+            ev = self.web_job_events.get(job_id)
+            job = self.web_jobs.get(job_id)
+            if ev and job and job['state'] == 'running':
+                ev['pause'].set()
+                job['state'] = 'paused'
+                job['message'] = '一時停止中'
+                return True
+        return False
+
+    def resume_web_job(self, job_id):
+        with self._web_jobs_lock:
+            ev = self.web_job_events.get(job_id)
+            job = self.web_jobs.get(job_id)
+            if ev and job and job['state'] == 'paused':
+                ev['pause'].clear()
+                job['state'] = 'running'
+                job['message'] = '再開しました'
+                return True
+        return False
+
+    def stop_web_job(self, job_id):
+        with self._web_jobs_lock:
+            ev = self.web_job_events.get(job_id)
+            job = self.web_jobs.get(job_id)
+            if ev and job and job['state'] in ('queued', 'running', 'paused'):
+                ev['stop'].set()
+                ev['pause'].clear()   # 一時停止ループから抜けて stop を見られるようにする
+                job['state'] = 'stopping'
+                job['message'] = '停止中…'
+                return True
+        return False
+
+    def _web_job_stop_requested(self, job_id):
+        with self._web_jobs_lock:
+            ev = self.web_job_events.get(job_id)
+            return bool(ev and ev['stop'].is_set())
 
     def _web_queue_worker(self):
         while True:
@@ -881,13 +998,22 @@ class PixivVaultServer(ThreadingHTTPServer):
             kind = task['kind']
             target_id = task['id']
             try:
+                # 停止がキュー待機中に要求済みなら実行せずに停止扱いにする。
+                if self._web_job_stop_requested(job_id):
+                    self.update_web_job(job_id, state='stopped', message='停止しました')
+                    self.web_download_queue.task_done()
+                    continue
                 self.update_web_job(job_id, state='running', message='開始しました')
                 self._run_web_download_job(job_id, kind, target_id, task.get('options'), task.get('new_only', False))
-                self.update_web_job(job_id, state='done', message='完了しました')
-                job = self.get_web_job(job_id)
-                if job is not None:
-                    self.update_web_job(job_id, done=job.get('total', 1))
-                self._notify_web_job_result(kind, target_id, success=True)
+                # 7.7: stop_event で途中終了した場合は「完了」ではなく「停止」として確定する。
+                if self._web_job_stop_requested(job_id):
+                    self.update_web_job(job_id, state='stopped', message='停止しました')
+                else:
+                    self.update_web_job(job_id, state='done', message='完了しました')
+                    job = self.get_web_job(job_id)
+                    if job is not None:
+                        self.update_web_job(job_id, done=job.get('total', 1))
+                    self._notify_web_job_result(kind, target_id, success=True)
             except Exception as e:
                 logger.exception(f"[アプリ連携] ジョブ失敗 ({job_id}): {e}")
                 self.update_web_job(job_id, state='error', message=str(e))
@@ -923,11 +1049,20 @@ class PixivVaultServer(ThreadingHTTPServer):
         client = PixivClient(db=self.db)
         options = options or {}
 
+        # 7.7: このジョブの stop/pause イベント（core.py の各バックアップ関数が作品単位でチェック）。
+        with self._web_jobs_lock:
+            ev = self.web_job_events.get(job_id) or {}
+        stop_event = ev.get('stop')
+        pause_event = ev.get('pause')
+
         def log_cb(msg, color=None):
             logger.debug(f"[アプリ連携] {msg}")
 
         def progress_cb(idx, total, elapsed):
-            self.update_web_job(job_id, done=idx, total=total, message=f'{idx}/{total} 件処理中')
+            # 7.7: 残り時間 = elapsed/done × (total-done)。一時停止中は state を上書きしない
+            # （resume まで core は待機し progress_cb を呼ばないため、通常はここに来ない）。
+            eta = int(elapsed / idx * (total - idx)) if idx > 0 and total > idx and elapsed > 0 else None
+            self.update_web_job(job_id, done=idx, total=total, etaSeconds=eta, message=f'{idx}/{total} 件処理中')
 
         if kind == 'work':
             if new_only:
@@ -943,9 +1078,14 @@ class PixivVaultServer(ThreadingHTTPServer):
                 self.update_web_job(job_id, message=f"作者 {work.get('user_name', author_id)} の新規作品を確認中")
                 run_backup(
                     user_id=str(author_id), client=client, db=self.db, target_type='both',
-                    log_callback=log_cb, progress_callback=progress_cb, new_only=True, options=options
+                    log_callback=log_cb, progress_callback=progress_cb, new_only=True, options=options,
+                    stop_event=stop_event, pause_event=pause_event
                 )
             else:
+                # 単一作品は run_single_work_backup が stop/pause 非対応（1件で短時間）。
+                # 開始前に停止要求があればスキップだけする。
+                if stop_event and stop_event.is_set():
+                    return
                 work = client.get_work_info(target_id)
                 is_novel = False
                 if not work:
@@ -959,7 +1099,8 @@ class PixivVaultServer(ThreadingHTTPServer):
         elif kind == 'author':
             run_backup(
                 user_id=target_id, client=client, db=self.db, target_type='both',
-                log_callback=log_cb, progress_callback=progress_cb, new_only=new_only, options=options
+                log_callback=log_cb, progress_callback=progress_cb, new_only=new_only, options=options,
+                stop_event=stop_event, pause_event=pause_event
             )
 
         elif kind == 'bookmarks':
@@ -968,7 +1109,8 @@ class PixivVaultServer(ThreadingHTTPServer):
                 raise Exception('ログイン状態を確認できませんでした（cookies.txtをご確認ください）')
             download_bookmarks(
                 db=self.db, client=client, my_user_id=my_user_id, target_type='both', rest_type='show',
-                log_callback=log_cb, progress_callback=progress_cb, options=options
+                log_callback=log_cb, progress_callback=progress_cb, options=options,
+                stop_event=stop_event, pause_event=pause_event
             )
 
         elif kind == 'following':
@@ -981,12 +1123,14 @@ class PixivVaultServer(ThreadingHTTPServer):
                 raise Exception('フォロー中のユーザーが見つかりませんでした')
 
             def batch_progress_cb(idx, total, user_id, elapsed):
-                self.update_web_job(job_id, done=idx, total=total, message=f'{idx}/{total} 人目: {user_id}')
+                eta = int(elapsed / idx * (total - idx)) if idx > 0 and total > idx and elapsed > 0 else None
+                self.update_web_job(job_id, done=idx, total=total, etaSeconds=eta, message=f'{idx}/{total} 人目: {user_id}')
 
             run_batch_backup(
                 user_ids=user_ids, client=client, db=self.db, target_type='both',
                 log_callback=log_cb, progress_callback=progress_cb,
-                batch_progress_callback=batch_progress_cb, new_only=new_only, options=options
+                batch_progress_callback=batch_progress_cb, new_only=new_only, options=options,
+                stop_event=stop_event, pause_event=pause_event
             )
         else:
             raise Exception(f'不明な target.kind: {kind}')
